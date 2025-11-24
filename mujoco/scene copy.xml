@@ -1,0 +1,109 @@
+<mujoco model="humanoid_with_bricks">
+  <compiler inertiafromgeom="true" angle="degree" />
+  <option gravity="0 0 -9.81" timestep="0.002" />
+
+  <!-- Basic assets -->
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.1 0.1" />
+    <material name="ground_mat" texture="grid" texrepeat="20 20" rgba="1 1 1 1" />
+    <material name="brick_mat" rgba="0.8 0.2 0.2 1" />
+  </asset>
+
+  <!-- World body and ground -->
+  <worldbody>
+    <geom name="ground" type="plane" pos="0 0 0" size="5 5 0.1" material="ground_mat" condim="3" friction="1 0.005 0.0001"/>
+
+    <!-- Humanoid (very simple placeholder) -->
+    <body name="robot0_root" pos="0 0 0"> 
+      <include file="models/g1-0.xml" />
+    </body>
+
+    <body name="robot1_root" pos="0 0 1.4"> 
+      <include file="models/g1-1.xml" />
+    </body>
+
+    <!-- Bricks -->
+        <!-- Brick wall: 3 layers with 4-3-4 bricks -->
+    <!-- Brick geom: size="0.1 0.05 0.025"  => height = 0.05, so centers at 0.05, 0.10, 0.15 -->
+
+    <!-- Layer 1: 4 bricks -->
+    <body name="brick_L1_1" pos="0.3 0.6 0.05">
+      <joint name="brick_L1_1_free" type="free"/>
+      <geom name="brick_L1_1_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <body name="brick_L1_2" pos="0.55 0.6 0.05">
+      <joint name="brick_L1_2_free" type="free"/>
+      <geom name="brick_L1_2_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <body name="brick_L1_3" pos="0.8 0.6 0.05">
+      <joint name="brick_L1_3_free" type="free"/>
+      <geom name="brick_L1_3_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <body name="brick_L1_4" pos="1.05 0.6 0.05">
+      <joint name="brick_L1_4_free" type="free"/>
+      <geom name="brick_L1_4_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <!-- Layer 2: 3 bricks, horizontally offset -->
+    <body name="brick_L2_1" pos="0.425 0.6 0.10">
+      <joint name="brick_L2_1_free" type="free"/>
+      <geom name="brick_L2_1_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <body name="brick_L2_2" pos="0.675 0.6 0.10">
+      <joint name="brick_L2_2_free" type="free"/>
+      <geom name="brick_L2_2_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <body name="brick_L2_3" pos="0.925 0.6 0.10">
+      <joint name="brick_L2_3_free" type="free"/>
+      <geom name="brick_L2_3_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <!-- Layer 3: 4 bricks on top again -->
+    <body name="brick_L3_1" pos="0.3 0.6 0.15">
+      <joint name="brick_L3_1_free" type="free"/>
+      <geom name="brick_L3_1_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <body name="brick_L3_2" pos="0.55 0.6 0.15">
+      <joint name="brick_L3_2_free" type="free"/>
+      <geom name="brick_L3_2_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <body name="brick_L3_3" pos="0.8 0.6 0.15">
+      <joint name="brick_L3_3_free" type="free"/>
+      <geom name="brick_L3_3_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <body name="brick_L3_4" pos="1.05 0.6 0.15">
+      <joint name="brick_L3_4_free" type="free"/>
+      <geom name="brick_L3_4_geom" type="box" size="0.1 0.05 0.025" mass="1.0"
+            material="brick_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+
+  </worldbody>
+
+  <!-- Actuators for joints (just a few as example) -->
+  <actuator>
+    <motor name="act_right_hip" joint="right_hip_pitch" ctrlrange="-1 1"/>
+    <motor name="act_right_knee" joint="right_knee_pitch" ctrlrange="-1 1"/>
+    <motor name="act_left_hip" joint="left_hip_pitch" ctrlrange="-1 1"/>
+    <motor name="act_left_knee" joint="left_knee_pitch" ctrlrange="-1 1"/>
+  </actuator>
+</mujoco>
