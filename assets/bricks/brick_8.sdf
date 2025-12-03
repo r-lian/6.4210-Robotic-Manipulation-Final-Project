@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<sdf xmlns:drake="drake.mit.edu" version="1.7">
+  <model name="brick_model">
+    <link name="brick_link">
+      <inertial>
+        <mass>1.0</mass>
+        <inertia>
+          <ixx>0.001</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.001</iyy><iyz>0</iyz>
+          <izz>0.001</izz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry><box><size>0.2 0.1 0.06</size></box></geometry>
+        <drake:proximity_properties>
+          <drake:rigid_hydroelastic/>
+          <drake:mu_static>0.90</drake:mu_static>
+          <drake:mu_dynamic>0.80</drake:mu_dynamic>
+        </drake:proximity_properties>
+      </collision>
+      <visual name="visual">
+        <geometry><box><size>0.2 0.1 0.06</size></box></geometry>
+      </visual>
+    </link>
+  </model>
+</sdf>
