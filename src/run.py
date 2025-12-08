@@ -125,30 +125,27 @@ if __name__ == "__main__":
     def solve_ik(
         X_WG: RigidTransform,
         max_tries: int = 10,
-        fix_base: bool = False,
         base_pose: np.ndarray | None = None,
         iiwa_name: str = "iiwa_left",
         wsg_name: str = "wsg_left",
     ) -> np.ndarray | None:
-        if base_pose is None:
-            base_pose = np.zeros(3)
-
-        np.random.seed(16)  # we use this for verification - do not modify it
-        
-        # Local builder/station/plant for isolated IK solving
-        builder_local = DiagramBuilder()
-        station_local = MakeHardwareStation(LoadScenario(data=scenario_yaml), meshcat)
-        builder_local.AddSystem(station_local)
-        
-        plant = station_local.plant()
+        plant = station.plant()
         wsg_model = plant.GetModelInstanceByName(wsg_name)
         G_body = plant.GetBodyByName("body", wsg_model)
         
         # Note: passing in a plant_context is necessary for collision-free constraints!
-        station_ctx = station_local.CreateDefaultContext()
-        plant_ctx = plant.GetMyContextFromRoot(station_ctx)
+        station_ctx = station.CreateDefaultContext()
+        # Get the plant's subsystem Context from the station's Diagram Context
+        try:
+            plant_ctx = station.GetSubsystemContext(plant, station_ctx)
+        except Exception:
+            plant_ctx = plant.GetMyContextFromRoot(station_ctx)
+
         ik = InverseKinematics(plant, plant_ctx)
-        q_variables = ik.q()
+        # Active arm 7-DoF contiguous block (avoid fancy indexing on ik.q())
+        iiwa_model = plant.GetModelInstanceByName(iiwa_name)
+        start = plant.GetJointByName("iiwa_joint_1", iiwa_model).position_start()
+        q_variables = ik.q()[start:start + 7]
         prog = ik.prog()
         prog.AddQuadraticErrorCost(np.eye(len(q_variables)), np.zeros(len(q_variables)), q_variables)
 
@@ -172,7 +169,6 @@ if __name__ == "__main__":
         for count in range(max_tries):
             # TODO: Compute a random initial guess here, within the joint limits of the robot
             q_guess = plant.GetPositions(plant_ctx, plant.GetModelInstanceByName(iiwa_name))
-            print(q_guess)
             lower_jl, upper_jl = plant.GetPositionLowerLimits(), plant.GetPositionUpperLimits()
             for i in range(len(q_variables)):
                 if q_guess[i] > lower_jl[i] and q_guess[i] < upper_jl[i]:
@@ -186,15 +182,11 @@ if __name__ == "__main__":
             prog.SetInitialGuess(q_variables, q_guess)
 
             result = Solve(prog)
-            print("reall we failed here?")
 
             if result.is_success():
                 print("Succeeded in %d tries!" % (count + 1))
                 q_full = result.GetSolution(q_variables)
-                # Extract this arm's 7 DoF in a consistent order using the same plant
-                plant.SetPositions(plant_ctx, q_full)
-                iiwa_model = plant.GetModelInstanceByName(iiwa_name)
-                return plant.GetPositions(plant_ctx, iiwa_model)
+                return q_full
 
         print("Failed!")
         return None
@@ -209,48 +201,106 @@ if __name__ == "__main__":
         q0: np.ndarray | None = None,
     ) -> None:
         builder = DiagramBuilder()
-        station = MakeHardwareStation(LoadScenario(data=scenario_yaml), meshcat)
-        builder.AddSystem(station)
-        plant_local = station.plant()
+        station_runner = MakeHardwareStation(scenario, meshcat)
+        builder.AddSystem(station_runner)
+        plant_local = station_runner.plant()
         traj_pos = PiecewisePose.MakeLinear(times, poses)
         traj_VG = traj_pos.MakeDerivative()
+        # DEBUG: visualize triads along this DIK segment
+        seg_id = int(time.time() * 1000)
+        t0, tf = times[0], times[-1]
+        n_samples = max(6, min(30, 3 * len(times)))
+        for k, tk in enumerate(np.linspace(t0, tf, n_samples)):
+            AddMeshcatTriad(meshcat, f"debug/diffik/seg_{seg_id}_{k}", X_PT=traj_pos.GetPose(tk), length=0.05, radius=0.002)
         V_src = builder.AddSystem(TrajectorySource(traj_VG))
         dik = builder.AddSystem(PseudoInverseController(plant=plant_local, iiwa_model_name=iiwa_name, wsg_model_name=wsg_name))
         integ = builder.AddSystem(Integrator(7))
         builder.Connect(V_src.get_output_port(), dik.get_input_port(0))
         builder.Connect(dik.get_output_port(), integ.get_input_port())
-        builder.Connect(integ.get_output_port(), station.GetInputPort(f"{iiwa_name}.position"))
-        builder.Connect(station.GetOutputPort(f"{iiwa_name}.position_measured"), dik.get_input_port(1))
+        builder.Connect(integ.get_output_port(), station_runner.GetInputPort(f"{iiwa_name}.position"))
+        builder.Connect(station_runner.GetOutputPort(f"{iiwa_name}.position_measured"), dik.get_input_port(1))
         # Optional gripper position profile
         if finger_values is not None:
             wsg_src = builder.AddSystem(TrajectorySource(PiecewisePolynomial.FirstOrderHold(times, finger_values)))
-            builder.Connect(wsg_src.get_output_port(), station.GetInputPort(f"{wsg_name}.position"))
+            builder.Connect(wsg_src.get_output_port(), station_runner.GetInputPort(f"{wsg_name}.position"))
         # Keep the other arm stiff and its gripper open
         other_iiwa = "iiwa_right" if iiwa_name == "iiwa_left" else "iiwa_left"
         other_wsg = "wsg_right" if wsg_name == "wsg_left" else "wsg_left"
-        builder.Connect(station.GetOutputPort(f"{other_iiwa}.position_measured"), station.GetInputPort(f"{other_iiwa}.position"))
+        builder.Connect(station_runner.GetOutputPort(f"{other_iiwa}.position_measured"), station_runner.GetInputPort(f"{other_iiwa}.position"))
         opened = 0.107
         builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
-                        station.GetInputPort(f"{other_wsg}.position"))
+                        station_runner.GetInputPort(f"{other_wsg}.position"))
         # Increase force limits
         try:
             builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([600.0]))).get_output_port(),
-                            station.GetInputPort(f"{wsg_name}.force_limit"))
+                            station_runner.GetInputPort(f"{wsg_name}.force_limit"))
             builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([600.0]))).get_output_port(),
-                            station.GetInputPort(f"{other_wsg}.force_limit"))
+                            station_runner.GetInputPort(f"{other_wsg}.force_limit"))
         except Exception:
             pass
         diagram = builder.Build()
         sim = Simulator(diagram)
         # Initialize integrator state
         ctx = sim.get_mutable_context()
+        # Seed from global station if no q0 provided
         if q0 is None:
-            q0 = plant_local.GetPositions(plant_local.GetMyContextFromRoot(ctx), plant_local.GetModelInstanceByName(iiwa_name))
+            try:
+                plant_global = station.plant()
+                ctx_global = station.CreateDefaultContext()
+                q0 = plant_global.GetPositions(plant_global.GetMyContextFromRoot(ctx_global), plant_global.GetModelInstanceByName(iiwa_name))
+            except Exception:
+                q0 = plant_local.GetPositions(plant_local.GetMyContextFromRoot(ctx), plant_local.GetModelInstanceByName(iiwa_name))
+        # Also set the plant's initial joint positions for consistent measured/visual pose
+        plant_local.SetPositions(plant_local.GetMyContextFromRoot(ctx), plant_local.GetModelInstanceByName(iiwa_name), q0)
+        # Publish once at q0 to avoid a visual reset on first frame
+        diagram.ForcedPublish(ctx)
         integ.GetMyContextFromRoot(ctx).get_mutable_continuous_state_vector().SetFromVector(q0)
         sim.set_target_realtime_rate(1.0)
         sim.Initialize()
         sim.AdvanceTo(times[-1])
 
+    # Minimal joint-space polynomial interpolation to a target q
+    def joint_poly_interp_to_q(
+        q_target: np.ndarray | None,
+        iiwa_name: str,
+        wsg_name: str,
+        duration_s: float = 1.5,
+        opened: float = 0.107,
+    ) -> None:
+        if q_target is None or q_target.shape[0] != 7:
+            return
+        b = DiagramBuilder()
+        st = MakeHardwareStation(scenario, meshcat)
+        b.AddSystem(st)
+        pl = st.plant()
+        ctx = st.CreateDefaultContext()
+        model = pl.GetModelInstanceByName(iiwa_name)
+        q_now = pl.GetPositions(pl.GetMyContextFromRoot(ctx), model)
+        T = [0.0, duration_s]
+        q_mat = np.column_stack([q_now, q_target])
+        q_traj = PiecewisePolynomial.CubicShapePreserving(T, q_mat, True)
+        src = b.AddSystem(TrajectorySource(q_traj))
+        b.Connect(src.get_output_port(), st.GetInputPort(f"{iiwa_name}.position"))
+        # Hold other arm; keep grippers open; set force limits
+        other_iiwa = "iiwa_right" if iiwa_name == "iiwa_left" else "iiwa_left"
+        other_wsg = "wsg_right" if wsg_name == "wsg_left" else "wsg_left"
+        b.Connect(st.GetOutputPort(f"{other_iiwa}.position_measured"), st.GetInputPort(f"{other_iiwa}.position"))
+        b.Connect(b.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
+                  st.GetInputPort(f"{wsg_name}.position"))
+        b.Connect(b.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
+                  st.GetInputPort(f"{other_wsg}.position"))
+        try:
+            b.Connect(b.AddSystem(ConstantVectorSource(np.array([200.0]))).get_output_port(),
+                      st.GetInputPort(f"{wsg_name}.force_limit"))
+            b.Connect(b.AddSystem(ConstantVectorSource(np.array([200.0]))).get_output_port(),
+                      st.GetInputPort(f"{other_wsg}.force_limit"))
+        except Exception:
+            pass
+        d = b.Build()
+        s = Simulator(d)
+        s.set_target_realtime_rate(1.0)
+        s.Initialize()
+        s.AdvanceTo(T[-1])
     # --------- Analytic antipodal grasp for a box in its own frame (O) ----------
     def compute_antipodal_grasp_box_O(
         size_oxo: list[float] | np.ndarray,
@@ -288,7 +338,7 @@ if __name__ == "__main__":
         """
         # Build a fresh station/diagram for the motion
         builder_local = DiagramBuilder()
-        station_local = MakeHardwareStation(LoadScenario(data=scenario_yaml), meshcat)
+        station_local = MakeHardwareStation(scenario, meshcat)
         builder_local.AddSystem(station_local)
         plant = station_local.plant()
         # Choose arm by proximity
@@ -307,30 +357,14 @@ if __name__ == "__main__":
         X_hover = RigidTransform(X_grasp.rotation(), X_grasp.translation() + np.array([0.0, 0.0, hover]))
         X_WGgoal = X_WGoal @ X_OG 
         X_WGgoal_hover = RigidTransform(X_WGgoal.rotation(), X_WGgoal.translation() + np.array([0.0, 0.0, hover]))
-        X_Gs = [X_WGinitial, X_hover, X_grasp, X_grasp, X_grasp, X_hover, X_WGgoal_hover, X_WGgoal, X_WGgoal_hover]
-        # Use DIK only for: prepick->grasp (1->2), grasp->postpick (4->5), preplace->place (6->7), place->postplace (7->8).
-        # Zero-out other segments by making consecutive poses equal, so traj derivative is zero there.
-        X_Gs_dik = list(X_Gs)
-        # initial->prepick: hold (no DIK)
-        X_Gs_dik[1] = X_Gs_dik[0]
-        # postpick->preplace: hold (no DIK)
-        X_Gs_dik[6] = X_Gs_dik[5]
-        sample_times = [0, 1.5, 3.0, 4.0, 5.0, 6.5, 9, 10.5, 12]
+
         # Gripper (open/close) profile
         opened = 0.107
         closed = 0.0
-        finger_values = np.asarray([opened, opened, opened, closed, closed, closed, closed, opened, opened]).reshape(1, -1)
-
-        # Visualize the full high-level path
-        traj_pos_vis = PiecewisePose.MakeLinear(sample_times, X_Gs)
-        all_samples = 40
-        t_grid = np.linspace(sample_times[0], sample_times[-1], all_samples)
-        for j, tj in enumerate(t_grid):
-            Xj = traj_pos_vis.GetPose(tj)
-            AddMeshcatTriad(meshcat, f"debug/dik_path/all_{j}", X_PT=Xj, length=0.05, radius=0.002)
 
         # 1) IK: initial -> prepick hover
         q_pre_pick = solve_ik(X_hover, iiwa_name=iiwa_name, wsg_name=wsg_name)
+        joint_poly_interp_to_q(q_pre_pick, iiwa_name, wsg_name, duration_s=1.5, opened=opened)
         # 2) DIK: prepick -> grasp -> postpick
         poses_pick = [X_hover, X_grasp, X_grasp, X_hover]
         times_pick = [0.0, 1.5, 3.0, 4.0]
@@ -338,6 +372,8 @@ if __name__ == "__main__":
         diffik(poses_pick, times_pick, iiwa_name, wsg_name, fingers_pick, q0=q_pre_pick if q_pre_pick is not None else None)
         # 3) IK: postpick -> preplace hover
         q_pre_place = solve_ik(X_WGgoal_hover, iiwa_name=iiwa_name, wsg_name=wsg_name)
+        # Polynomial interpolate joints to the preplace hover
+        joint_poly_interp_to_q(q_pre_place, iiwa_name, wsg_name, duration_s=1.5, opened=opened)
         # 4) DIK: preplace -> place -> postplace
         poses_place = [X_WGgoal_hover, X_WGgoal, X_WGgoal_hover]
         times_place = [0.0, 1.5, 3.0]
@@ -808,101 +844,96 @@ model_drivers:
     # simulator.AdvanceTo(30)
 
     # ---------------- ICP -> antipodal grasp -> IK place ----------------
-    try:
-        context = simulator.get_context()
-        # Grab point clouds exposed on the diagram
-        pc0 = diagram.GetOutputPort("camera_point_cloud0").Eval(context)
-        pc1 = diagram.GetOutputPort("camera_point_cloud1").Eval(context)
-        pc2 = diagram.GetOutputPort("camera_point_cloud2").Eval(context)
-        pc3 = diagram.GetOutputPort("camera_point_cloud3").Eval(context)
+    context = simulator.get_context()
+    # Grab point clouds exposed on the diagram
+    pc0 = diagram.GetOutputPort("camera_point_cloud0").Eval(context)
+    pc1 = diagram.GetOutputPort("camera_point_cloud1").Eval(context)
+    pc2 = diagram.GetOutputPort("camera_point_cloud2").Eval(context)
+    pc3 = diagram.GetOutputPort("camera_point_cloud3").Eval(context)
 
-        # Merge
-        merged = Concatenate([pc0, pc1, pc2, pc3])
-        # Crop by height to remove most ground and robot; keep expected brick band
-        z = merged.xyzs()[2, :]
-        keep = (z >= 0.02) & (z <= 0.25)
-        cropped = PointCloud(int(np.sum(keep)))
-        cropped.mutable_xyzs()[:] = merged.xyzs()[:, keep]
-        # Optional: visualize merged/cropped scene cloud
-        # meshcat.SetObject("debug/icp/scene_cropped", cropped, point_size=0.02)
+    # Merge
+    merged = Concatenate([pc0, pc1, pc2, pc3])
+    # Crop by height to remove most ground and robot; keep expected brick band
+    z = merged.xyzs()[2, :]
+    keep = (z >= 0.02) & (z <= 0.25)
+    cropped = PointCloud(int(np.sum(keep)))
+    cropped.mutable_xyzs()[:] = merged.xyzs()[:, keep]
+    # Optional: visualize merged/cropped scene cloud
+    # meshcat.SetObject("debug/icp/scene_cropped", cropped, point_size=0.02)
 
-        # Downsample for faster ICP
-        scene_cloud = cropped.VoxelizedDownSample(0.01)
+    # Downsample for faster ICP
+    scene_cloud = cropped.VoxelizedDownSample(0.01)
 
-        # Build a simple model point cloud for our brick (box), centered at origin
-        def sample_box_surface(size_xyz, num_samples=2000) -> PointCloud:
-            sx, sy, sz = size_xyz
-            areas = np.array([sy*sz, sy*sz, sx*sz, sx*sz, sx*sy, sx*sy], dtype=float)
-            probs = areas / np.sum(areas)
-            face_ids = np.random.choice(6, size=num_samples, p=probs)
-            u = np.random.uniform(-0.5, 0.5, size=num_samples)
-            v = np.random.uniform(-0.5, 0.5, size=num_samples)
-            pts = np.zeros((3, num_samples))
-            mask = face_ids == 0; pts[:, mask] = np.vstack([np.full(np.sum(mask), +sx/2), sy*u[mask], sz*v[mask]])
-            mask = face_ids == 1; pts[:, mask] = np.vstack([np.full(np.sum(mask), -sx/2), sy*u[mask], sz*v[mask]])
-            mask = face_ids == 2; pts[:, mask] = np.vstack([sx*u[mask], np.full(np.sum(mask), +sy/2), sz*v[mask]])
-            mask = face_ids == 3; pts[:, mask] = np.vstack([sx*u[mask], np.full(np.sum(mask), -sy/2), sz*v[mask]])
-            mask = face_ids == 4; pts[:, mask] = np.vstack([sx*u[mask], sy*v[mask], np.full(np.sum(mask), +sz/2)])
-            mask = face_ids == 5; pts[:, mask] = np.vstack([sx*u[mask], sy*v[mask], np.full(np.sum(mask), -sz/2)])
-            model = PointCloud(num_samples)
-            model.mutable_xyzs()[:] = pts
-            return model
+    # Build a simple model point cloud for our brick (box), centered at origin
+    def sample_box_surface(size_xyz, num_samples=2000) -> PointCloud:
+        sx, sy, sz = size_xyz
+        areas = np.array([sy*sz, sy*sz, sx*sz, sx*sz, sx*sy, sx*sy], dtype=float)
+        probs = areas / np.sum(areas)
+        face_ids = np.random.choice(6, size=num_samples, p=probs)
+        u = np.random.uniform(-0.5, 0.5, size=num_samples)
+        v = np.random.uniform(-0.5, 0.5, size=num_samples)
+        pts = np.zeros((3, num_samples))
+        mask = face_ids == 0; pts[:, mask] = np.vstack([np.full(np.sum(mask), +sx/2), sy*u[mask], sz*v[mask]])
+        mask = face_ids == 1; pts[:, mask] = np.vstack([np.full(np.sum(mask), -sx/2), sy*u[mask], sz*v[mask]])
+        mask = face_ids == 2; pts[:, mask] = np.vstack([sx*u[mask], np.full(np.sum(mask), +sy/2), sz*v[mask]])
+        mask = face_ids == 3; pts[:, mask] = np.vstack([sx*u[mask], np.full(np.sum(mask), -sy/2), sz*v[mask]])
+        mask = face_ids == 4; pts[:, mask] = np.vstack([sx*u[mask], sy*v[mask], np.full(np.sum(mask), +sz/2)])
+        mask = face_ids == 5; pts[:, mask] = np.vstack([sx*u[mask], sy*v[mask], np.full(np.sum(mask), -sz/2)])
+        model = PointCloud(num_samples)
+        model.mutable_xyzs()[:] = pts
+        return model
 
-        model_cloud = sample_box_surface(brick_size, num_samples=2500)
-        # meshcat.SetObject("debug/icp/model_cloud", model_cloud, point_size=0.02)
+    model_cloud = sample_box_surface(brick_size, num_samples=2500)
+    # meshcat.SetObject("debug/icp/model_cloud", model_cloud, point_size=0.02)
 
-        # Initial guess: put model at the scene centroid, identity rotation
-        centroid = np.mean(scene_cloud.xyzs(), axis=1)
-        X_init = RigidTransform(RotationMatrix.Identity(), centroid)
+    # Initial guess: put model at the scene centroid, identity rotation
+    centroid = np.mean(scene_cloud.xyzs(), axis=1)
+    X_init = RigidTransform(RotationMatrix.Identity(), centroid)
 
-        # Run ICP
-        model_pts = model_cloud.xyzs()
-        scene_pts = scene_cloud.xyzs()
-        X_brick_est, err = IterativeClosestPoint(
-            p_Om=model_pts,
-            p_Ws=scene_pts,
-            X_Ohat=X_init,
-            meshcat=meshcat,
-            max_iterations=50,
-        )
-        
-        # Show the aligned model
-        # meshcat.SetTransform("debug/icp/aligned_pose", X_brick_est)
-        # meshcat.SetObject("debug/icp/aligned_pc", model_cloud, point_size=0.03)
-        AddMeshcatTriad(meshcat, "debug/icp/pose", X_PT=X_brick_est, length=0.1, radius=0.003)
-
-        # Multi-brick estimation via clustering + ICP, then run place on the first target
-        print("Estimating brick poses...")
-        try:
-            poses = estimate_brick_poses_from_scene(
-                scene_cloud=scene_cloud,
-                model_cloud=model_cloud,
-                meshcat=meshcat,
-                label_prefix="debug/icp_multi",
-            )
-        except Exception as e:
-            print(f"[ICP] estimate_brick_poses_from_scene failed: {e}")
-            traceback.print_exc()
-            poses = []
-        print("poses:", len(poses))
-        if len(poses) > 0:
-            X_first = poses[0]
-            print(len(poses), "poses")
-            X_goal = RigidTransform(X_first.rotation(), np.array([0.0, 0.0, X_first.translation()[2]]))
-            # DEBUG: overlay ICP poses as translucent red rectangular prisms (brick-sized)
-            brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
-            meshcat.SetObject("debug/icp_multi/X_first_box", brick_box, Rgba(1, 0, 0, 0.4))  # red
-            meshcat.SetTransform("debug/icp_multi/X_first_box", X_first)
-            meshcat.SetObject("debug/icp_multi/X_goal_box", brick_box, Rgba(0, 0, 1, 0.4))  # blue
-            meshcat.SetTransform("debug/icp_multi/X_goal_box", X_goal)
-            AddMeshcatTriad(meshcat, "debug/icp_multi/X_first_tri", X_PT=X_first, length=0.12, radius=0.003)
-            AddMeshcatTriad(meshcat, "debug/icp_multi/X_goal_tri", X_PT=X_goal, length=0.12, radius=0.003)
-            place(X_first, X_goal, sim_duration=12.0)
-        else:
-            print("ICP clustering found no bricks.")
-    except Exception as e:
-        print(f"ICP pipeline warning: {e}")
-
+    # Run ICP
+    model_pts = model_cloud.xyzs()
+    scene_pts = scene_cloud.xyzs()
+    X_brick_est, err = IterativeClosestPoint(
+        p_Om=model_pts,
+        p_Ws=scene_pts,
+        X_Ohat=X_init,
+        meshcat=meshcat,
+        max_iterations=50,
+    )
     
+    # Show the aligned model
+    # meshcat.SetTransform("debug/icp/aligned_pose", X_brick_est)
+    # meshcat.SetObject("debug/icp/aligned_pc", model_cloud, point_size=0.03)
+    AddMeshcatTriad(meshcat, "debug/icp/pose", X_PT=X_brick_est, length=0.1, radius=0.003)
 
+    # Multi-brick estimation via clustering + ICP, then run place on the first target
+    print("Estimating brick poses...")
+    try:
+        poses = estimate_brick_poses_from_scene(
+            scene_cloud=scene_cloud,
+            model_cloud=model_cloud,
+            meshcat=meshcat,
+            label_prefix="debug/icp_multi",
+        )
+    except Exception as e:
+        print(f"[ICP] estimate_brick_poses_from_scene failed: {e}")
+        traceback.print_exc()
+        poses = []
+    print("poses:", len(poses))
+    if len(poses) > 0:
+        X_first = poses[0]
+        print(len(poses), "poses")
+        X_goal = RigidTransform(X_first.rotation(), np.array([0.0, 0.0, X_first.translation()[2]]))
+        # DEBUG: overlay ICP poses as translucent red rectangular prisms (brick-sized)
+        brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
+        meshcat.SetObject("debug/icp_multi/X_first_box", brick_box, Rgba(1, 0, 0, 0.4))  # red
+        meshcat.SetTransform("debug/icp_multi/X_first_box", X_first)
+        meshcat.SetObject("debug/icp_multi/X_goal_box", brick_box, Rgba(0, 0, 1, 0.4))  # blue
+        meshcat.SetTransform("debug/icp_multi/X_goal_box", X_goal)
+        AddMeshcatTriad(meshcat, "debug/icp_multi/X_first_tri", X_PT=X_first, length=0.12, radius=0.003)
+        AddMeshcatTriad(meshcat, "debug/icp_multi/X_goal_tri", X_PT=X_goal, length=0.12, radius=0.003)
+        place(X_first, X_goal, sim_duration=12.0)
+    else:
+        print("ICP clustering found no bricks.")
+        
     time.sleep(30)
