@@ -134,12 +134,9 @@ if __name__ == "__main__":
         G_body = plant.GetBodyByName("body", wsg_model)
         
         # Note: passing in a plant_context is necessary for collision-free constraints!
-        station_ctx = station.CreateDefaultContext()
-        # Get the plant's subsystem Context from the station's Diagram Context
-        try:
-            plant_ctx = station.GetSubsystemContext(plant, station_ctx)
-        except Exception:
-            plant_ctx = plant.GetMyContextFromRoot(station_ctx)
+        # Use the root diagram context and derive the plant subsystem context from it
+        root_ctx = simulator.get_mutable_context()
+        plant_ctx = plant.GetMyContextFromRoot(root_ctx)
 
         ik = InverseKinematics(plant, plant_ctx)
         # Active arm 7-DoF contiguous block (avoid fancy indexing on ik.q())
@@ -200,66 +197,59 @@ if __name__ == "__main__":
         finger_values: np.ndarray | None = None,
         q0: np.ndarray | None = None,
     ) -> None:
-        builder = DiagramBuilder()
-        station_runner = MakeHardwareStation(scenario, meshcat)
-        builder.AddSystem(station_runner)
-        plant_local = station_runner.plant()
+        # Use the single, global station/diagram/simulator (no rebuilds).
         traj_pos = PiecewisePose.MakeLinear(times, poses)
         traj_VG = traj_pos.MakeDerivative()
         # DEBUG: visualize triads along this DIK segment
         seg_id = int(time.time() * 1000)
-        t0, tf = times[0], times[-1]
+        t0, tf = float(times[0]), float(times[-1])
         n_samples = max(6, min(30, 3 * len(times)))
         for k, tk in enumerate(np.linspace(t0, tf, n_samples)):
             AddMeshcatTriad(meshcat, f"debug/diffik/seg_{seg_id}_{k}", X_PT=traj_pos.GetPose(tk), length=0.05, radius=0.002)
-        V_src = builder.AddSystem(TrajectorySource(traj_VG))
-        dik = builder.AddSystem(PseudoInverseController(plant=plant_local, iiwa_model_name=iiwa_name, wsg_model_name=wsg_name))
-        integ = builder.AddSystem(Integrator(7))
-        builder.Connect(V_src.get_output_port(), dik.get_input_port(0))
-        builder.Connect(dik.get_output_port(), integ.get_input_port())
-        builder.Connect(integ.get_output_port(), station_runner.GetInputPort(f"{iiwa_name}.position"))
-        builder.Connect(station_runner.GetOutputPort(f"{iiwa_name}.position_measured"), dik.get_input_port(1))
-        # Optional gripper position profile
-        if finger_values is not None:
-            wsg_src = builder.AddSystem(TrajectorySource(PiecewisePolynomial.FirstOrderHold(times, finger_values)))
-            builder.Connect(wsg_src.get_output_port(), station_runner.GetInputPort(f"{wsg_name}.position"))
-        # Keep the other arm stiff and its gripper open
-        other_iiwa = "iiwa_right" if iiwa_name == "iiwa_left" else "iiwa_left"
-        other_wsg = "wsg_right" if wsg_name == "wsg_left" else "wsg_left"
-        builder.Connect(station_runner.GetOutputPort(f"{other_iiwa}.position_measured"), station_runner.GetInputPort(f"{other_iiwa}.position"))
-        opened = 0.107
-        builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
-                        station_runner.GetInputPort(f"{other_wsg}.position"))
-        # Increase force limits
-        try:
-            builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([600.0]))).get_output_port(),
-                            station_runner.GetInputPort(f"{wsg_name}.force_limit"))
-            builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([600.0]))).get_output_port(),
-                            station_runner.GetInputPort(f"{other_wsg}.force_limit"))
-        except Exception:
-            pass
-        diagram = builder.Build()
-        sim = Simulator(diagram)
-        # Initialize integrator state
-        ctx = sim.get_mutable_context()
-        # Seed from global station if no q0 provided
+        # Global contexts and frames
+        root_ctx = simulator.get_mutable_context()
+        station_ctx = station.GetMyContextFromRoot(root_ctx)
+        plant_global = station.plant()
+        plant_ctx = plant_global.GetMyContextFromRoot(root_ctx)
+        iiwa_model = plant_global.GetModelInstanceByName(iiwa_name)
+        wsg_model = plant_global.GetModelInstanceByName(wsg_name)
+        G_frame = plant_global.GetBodyByName("body", wsg_model).body_frame()
+        # Seed q from current plant if not provided
         if q0 is None:
-            try:
-                plant_global = station.plant()
-                ctx_global = station.CreateDefaultContext()
-                q0 = plant_global.GetPositions(plant_global.GetMyContextFromRoot(ctx_global), plant_global.GetModelInstanceByName(iiwa_name))
-            except Exception:
-                q0 = plant_local.GetPositions(plant_local.GetMyContextFromRoot(ctx), plant_local.GetModelInstanceByName(iiwa_name))
-        # Also set the plant's initial joint positions for consistent measured/visual pose
-        plant_local.SetPositions(plant_local.GetMyContextFromRoot(ctx), plant_local.GetModelInstanceByName(iiwa_name), q0)
-        # Publish once at q0 to avoid a visual reset on first frame
-        diagram.ForcedPublish(ctx)
-        integ.GetMyContextFromRoot(ctx).get_mutable_continuous_state_vector().SetFromVector(q0)
-        sim.set_target_realtime_rate(1.0)
-        sim.Initialize()
-        print("diff ik starting...")
-        sim.AdvanceTo(times[-1])
-        print(f'diff ik: {times[-1]}\n')
+            q0 = plant_global.GetPositions(plant_ctx, iiwa_model)
+        q = np.array(q0, dtype=float)
+        # Ports
+        pos_port = station.GetInputPort(f"{iiwa_name}.position")
+        wsg_port = station.GetInputPort(f"{wsg_name}.position")
+        # Finger interpolation helper
+        def finger_at(t):
+            if finger_values is None:
+                return 0.107
+            ts = np.asarray(times, dtype=float)
+            vals = np.asarray(finger_values).reshape(1, -1)[0]
+            return float(np.interp(t, ts, vals))
+        # Step the global sim
+        dt = 0.02
+        t = t0
+        current = simulator.get_context().get_time()
+        while t <= tf + 1e-9:
+            V_G = np.asarray(traj_VG.value(t)).reshape(-1)
+            plant_global.SetPositions(plant_ctx, iiwa_model, q)
+            J = plant_global.CalcJacobianSpatialVelocity(
+                plant_ctx, JacobianWrtVariable.kV, G_frame, np.zeros((3, 1)), plant_global.world_frame(), plant_global.world_frame()
+            )
+            start = plant_global.GetJointByName("iiwa_joint_1", iiwa_model).velocity_start()
+            J7 = J[:, start:start + 7]
+            JJt = J7 @ J7.T
+            lam = 0.05
+            v = J7.T @ np.linalg.solve(JJt + (lam**2) * np.eye(6), V_G)
+            v = np.clip(v, -1.5, 1.5)
+            q = q + v * dt
+            pos_port.FixValue(station_ctx, q)
+            wsg_port.FixValue(station_ctx, np.array([finger_at(t)]))
+            current += dt
+            simulator.AdvanceTo(current)
+            t += dt
 
     # Minimal joint-space polynomial interpolation to a target q
     def joint_poly_interp_to_q(
@@ -271,40 +261,29 @@ if __name__ == "__main__":
     ) -> None:
         if q_target is None or q_target.shape[0] != 7:
             return
-        b = DiagramBuilder()
-        st_runner = MakeHardwareStation(scenario, meshcat)
-        b.AddSystem(st_runner)
-        pl = st_runner.plant()
-        ctx = st_runner.CreateDefaultContext()
-        model = pl.GetModelInstanceByName(iiwa_name)
-        q_now = pl.GetPositions(pl.GetMyContextFromRoot(ctx), model)
-        T = [0.0, duration_s]
+        # Use the single, global station/diagram/simulator (no rebuilds).
+        root_ctx = simulator.get_mutable_context()
+        station_ctx = station.GetMyContextFromRoot(root_ctx)
+        plant_global = station.plant()
+        plant_ctx = plant_global.GetMyContextFromRoot(root_ctx)
+        model = plant_global.GetModelInstanceByName(iiwa_name)
+        q_now = plant_global.GetPositions(plant_ctx, model)
+        T = [0.0, float(duration_s)]
         q_mat = np.column_stack([q_now, q_target])
         q_traj = PiecewisePolynomial.CubicShapePreserving(T, q_mat, True)
-        src = b.AddSystem(TrajectorySource(q_traj))
-        b.Connect(src.get_output_port(), st_runner.GetInputPort(f"{iiwa_name}.position"))
-        # Hold other arm; keep grippers open; set force limits
-        other_iiwa = "iiwa_right" if iiwa_name == "iiwa_left" else "iiwa_left"
-        other_wsg = "wsg_right" if wsg_name == "wsg_left" else "wsg_left"
-        b.Connect(st_runner.GetOutputPort(f"{other_iiwa}.position_measured"), st_runner.GetInputPort(f"{other_iiwa}.position"))
-        b.Connect(b.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
-                  st_runner.GetInputPort(f"{wsg_name}.position"))
-        b.Connect(b.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
-                  st_runner.GetInputPort(f"{other_wsg}.position"))
-        try:
-            b.Connect(b.AddSystem(ConstantVectorSource(np.array([200.0]))).get_output_port(),
-                      st_runner.GetInputPort(f"{wsg_name}.force_limit"))
-            b.Connect(b.AddSystem(ConstantVectorSource(np.array([200.0]))).get_output_port(),
-                      st_runner.GetInputPort(f"{other_wsg}.force_limit"))
-        except Exception:
-            pass
-        d = b.Build()
-        s = Simulator(d)
-        print("poly interp starting...")
-        s.set_target_realtime_rate(1.0)
-        s.Initialize()
-        s.AdvanceTo(T[-1])
-        print(f'poly interp: {T[-1]}\n')
+        pos_port = station.GetInputPort(f"{iiwa_name}.position")
+        wsg_port = station.GetInputPort(f"{wsg_name}.position")
+        # Step the global sim along the polynomial
+        dt = 0.02
+        t0, tf = 0.0, float(duration_s)
+        current = simulator.get_context().get_time()
+        while t0 <= tf + 1e-9:
+            q = np.asarray(q_traj.value(t0)).reshape(-1)
+            pos_port.FixValue(station_ctx, q)
+            wsg_port.FixValue(station_ctx, np.array([opened]))
+            current += dt
+            simulator.AdvanceTo(current)
+            t0 += dt
     # --------- Analytic antipodal grasp for a box in its own frame (O) ----------
     def compute_antipodal_grasp_box_O(
         size_oxo: list[float] | np.ndarray,
@@ -927,7 +906,15 @@ model_drivers:
     if len(poses) > 0:
         X_first = poses[0]
         print(len(poses), "poses")
-        X_goal = RigidTransform(X_first.rotation(), np.array([0.0, 0.0, X_first.translation()[2]]))
+        # Place goal: move brick by a small randomized offset in XY to verify place
+        offsets_xy = [
+            np.array([0.20, 0.00, 0.0]),
+            np.array([0.00, 0.20, 0.0]),
+            np.array([-0.20, 0.00, 0.0]),
+            np.array([0.00, -0.20, 0.0]),
+        ]
+        goal_offset = offsets_xy[np.random.randint(len(offsets_xy))]
+        X_goal = RigidTransform(X_first.rotation(), X_first.translation() + goal_offset)
         # DEBUG: overlay ICP poses as translucent red rectangular prisms (brick-sized)
         brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
         meshcat.SetObject("debug/icp_multi/X_first_box", brick_box, Rgba(1, 0, 0, 0.4))  # red
