@@ -271,35 +271,32 @@ if __name__ == "__main__":
     ) -> None:
         if q_target is None or q_target.shape[0] != 7:
             return
-        b = DiagramBuilder()
-        st_runner = MakeHardwareStation(scenario, meshcat)
-        b.AddSystem(st_runner)
-        pl = st_runner.plant()
-        ctx = st_runner.CreateDefaultContext()
-        model = pl.GetModelInstanceByName(iiwa_name)
-        q_now = pl.GetPositions(pl.GetMyContextFromRoot(ctx), model)
+        plant = station.plant()
+        ctx = station.CreateDefaultContext()
+        iiwa_model = plant.GetModelInstanceByName(iiwa_name)
+        q_now = plant.GetPositions(plant.GetMyContextFromRoot(ctx), iiwa_model)
         T = [0.0, duration_s]
         q_mat = np.column_stack([q_now, q_target])
         q_traj = PiecewisePolynomial.CubicShapePreserving(T, q_mat, True)
-        src = b.AddSystem(TrajectorySource(q_traj))
-        b.Connect(src.get_output_port(), st_runner.GetInputPort(f"{iiwa_name}.position"))
+        src = builder.AddSystem(TrajectorySource(q_traj))
+        builder.Connect(src.get_output_port(), station.GetInputPort(f"{iiwa_name}.position"))
         # Hold other arm; keep grippers open; set force limits
         other_iiwa = "iiwa_right" if iiwa_name == "iiwa_left" else "iiwa_left"
         other_wsg = "wsg_right" if wsg_name == "wsg_left" else "wsg_left"
-        b.Connect(st_runner.GetOutputPort(f"{other_iiwa}.position_measured"), st_runner.GetInputPort(f"{other_iiwa}.position"))
-        b.Connect(b.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
-                  st_runner.GetInputPort(f"{wsg_name}.position"))
-        b.Connect(b.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
-                  st_runner.GetInputPort(f"{other_wsg}.position"))
+        builder.Connect(station.GetOutputPort(f"{other_iiwa}.position_measured"), station.GetInputPort(f"{other_iiwa}.position"))
+        builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
+                  station.GetInputPort(f"{wsg_name}.position"))
+        builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
+                  station.GetInputPort(f"{other_wsg}.position"))
         try:
-            b.Connect(b.AddSystem(ConstantVectorSource(np.array([200.0]))).get_output_port(),
-                      st_runner.GetInputPort(f"{wsg_name}.force_limit"))
-            b.Connect(b.AddSystem(ConstantVectorSource(np.array([200.0]))).get_output_port(),
-                      st_runner.GetInputPort(f"{other_wsg}.force_limit"))
+            builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([200.0]))).get_output_port(),
+                      station.GetInputPort(f"{wsg_name}.force_limit"))
+            builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([200.0]))).get_output_port(),
+                      station.GetInputPort(f"{other_wsg}.force_limit"))
         except Exception:
             pass
-        d = b.Build()
-        s = Simulator(d)
+        d = builder.Build()
+        sim = Simulator(d)
         print("poly interp starting...")
         s.set_target_realtime_rate(1.0)
         s.Initialize()
@@ -845,7 +842,6 @@ model_drivers:
     simulator = Simulator(diagram)
     simulator.set_target_realtime_rate(10)
     simulator.Initialize()
-    # simulator.AdvanceTo(30)
 
     # ---------------- ICP -> antipodal grasp -> IK place ----------------
     context = simulator.get_context()
