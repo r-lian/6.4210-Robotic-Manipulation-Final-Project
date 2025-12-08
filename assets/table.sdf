@@ -23,8 +23,8 @@
                 <drake:proximity_properties>
                     <drake:compliant_hydroelastic/>
                     <drake:hydroelastic_modulus>5.0e7</drake:hydroelastic_modulus>
-                    <drake:mu_static>0.90</drake:mu_static>
-                    <drake:mu_dynamic>0.80</drake:mu_dynamic>
+                    <drake:mu_static>1.50</drake:mu_static>
+                    <drake:mu_dynamic>1.20</drake:mu_dynamic>
                 </drake:proximity_properties>
             </collision>
             <visual name="visual">

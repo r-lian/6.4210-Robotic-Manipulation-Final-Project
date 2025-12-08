@@ -1,4 +1,4 @@
-from pydrake.all import StartMeshcat, DiagramBuilder, Simulator, RigidTransform, RotationMatrix, PointCloud, Concatenate, LeafSystem, MultibodyPlant, BasicVector, Context, JacobianWrtVariable, PiecewisePose, PiecewisePolynomial, Trajectory, TrajectorySource, Integrator, ConstantVectorSource, Rgba, Box
+from pydrake.all import InverseKinematics, Solve, StartMeshcat, DiagramBuilder, Simulator, RigidTransform, RotationMatrix, PointCloud, Concatenate, LeafSystem, MultibodyPlant, BasicVector, Context, JacobianWrtVariable, PiecewisePose, PiecewisePolynomial, Trajectory, TrajectorySource, Integrator, ConstantVectorSource, Rgba, Box, RollPitchYaw
 from manipulation.letter_generation import create_sdf_asset_from_letter
 from manipulation.station import LoadScenario, MakeHardwareStation, AddPointClouds
 from manipulation.icp import IterativeClosestPoint
@@ -11,6 +11,14 @@ import traceback
 
 
 if __name__ == "__main__":
+
+    # Ensure randomized brick placement each run
+    try:
+        seed_val = (int(time.time_ns()) ^ int.from_bytes(os.urandom(8), "little")) & 0xFFFFFFFF
+        np.random.seed(seed_val)
+    except Exception:
+        np.random.seed(None)
+
 
     # ---------- Minimal Diff-IK utilities (not wired by default) ----------
     
@@ -47,8 +55,8 @@ if __name__ == "__main__":
                 <drake:proximity_properties>
                     <drake:compliant_hydroelastic/>
                     <drake:hydroelastic_modulus>5.0e7</drake:hydroelastic_modulus>
-                    <drake:mu_static>0.90</drake:mu_static>
-                    <drake:mu_dynamic>0.80</drake:mu_dynamic>
+                    <drake:mu_static>1.50</drake:mu_static>
+                    <drake:mu_dynamic>1.20</drake:mu_dynamic>
                 </drake:proximity_properties>
             </collision>
             <visual name="visual">
@@ -67,24 +75,293 @@ if __name__ == "__main__":
 """
     )
 
+    # ---------- Minimal Diff-IK controller and place() (basic version) ----------
+    class PseudoInverseController(LeafSystem):
+        def __init__(self, plant: MultibodyPlant, iiwa_model_name: str, wsg_model_name: str):
+            LeafSystem.__init__(self)
+            self._plant = plant
+            self._plant_context = plant.CreateDefaultContext()
+            self._iiwa = plant.GetModelInstanceByName(iiwa_model_name)
+            self._G = plant.GetBodyByName("body", plant.GetModelInstanceByName(wsg_model_name)).body_frame()
+            self._W = plant.world_frame()
+
+            self.V_G_port = self.DeclareVectorInputPort("V_WG", 6)
+            self.q_port = self.DeclareVectorInputPort("iiwa.position", 7)
+            self.DeclareVectorOutputPort("iiwa.velocity", 7, self.CalcOutput)
+            self.iiwa_start = plant.GetJointByName("iiwa_joint_1", self._iiwa).velocity_start()
+            self.iiwa_end = plant.GetJointByName("iiwa_joint_7", self._iiwa).velocity_start()
+
+        def CalcOutput(self, context: Context, output: BasicVector):
+            """
+            fill in our code below.
+            """
+
+            # evaluate the V_G_port and q_port on the current context to get those values.
+            V_G = self.V_G_port.Eval(context)
+            q = self.q_port.Eval(context)
+
+            # update the positions of the internal _plant_context according to `q`.
+            # HINT: you can write to a plant context by calling `self._plant.SetPositions`
+            self._plant.SetPositions(self._plant_context, self._iiwa, q)
+
+            # Compute the gripper jacobian
+            # HINT: the jacobian is 6 x N, with N being the number of DOFs.
+            # We only want the 6 x 7 submatrix corresponding to the IIWA
+            J_G = self._plant.CalcJacobianSpatialVelocity(
+                self._plant_context,
+                JacobianWrtVariable.kV,
+                self._G,
+                [0,0,0],
+                self._W,
+                self._W
+            )
+            # compute `v` by mapping the gripper velocity (from the V_G_port) to the joint space
+            J_G = J_G[:, self.iiwa_start:self.iiwa_end + 1]
+            v = np.linalg.pinv(J_G) @ V_G
+            # print(v)
+            output.SetFromVector(v)
+
+    # for normal IK with global optimization
+    def solve_ik(
+        X_WG: RigidTransform,
+        max_tries: int = 10,
+        fix_base: bool = False,
+        base_pose: np.ndarray | None = None,
+        iiwa_name: str = "iiwa_left",
+        wsg_name: str = "wsg_left",
+    ) -> np.ndarray | None:
+        if base_pose is None:
+            base_pose = np.zeros(3)
+
+        np.random.seed(16)  # we use this for verification - do not modify it
+        
+        # Local builder/station/plant for isolated IK solving
+        builder_local = DiagramBuilder()
+        station_local = MakeHardwareStation(LoadScenario(data=scenario_yaml), meshcat)
+        builder_local.AddSystem(station_local)
+        
+        plant = station_local.plant()
+        wsg_model = plant.GetModelInstanceByName(wsg_name)
+        G_body = plant.GetBodyByName("body", wsg_model)
+        
+        # Note: passing in a plant_context is necessary for collision-free constraints!
+        station_ctx = station_local.CreateDefaultContext()
+        plant_ctx = plant.GetMyContextFromRoot(station_ctx)
+        ik = InverseKinematics(plant, plant_ctx)
+        q_variables = ik.q()
+        prog = ik.prog()
+        prog.AddQuadraticErrorCost(np.eye(len(q_variables)), np.zeros(len(q_variables)), q_variables)
+
+        ik.AddPositionConstraint(
+            frameB=G_body.body_frame(),
+            p_BQ=np.zeros(3),
+            frameA=plant.world_frame(),
+            p_AQ_lower=X_WG.translation() - np.array([0.001, 0.001, 0.001]),
+            p_AQ_upper=X_WG.translation() + np.array([0.001, 0.001, 0.001]),
+        )
+        ik.AddOrientationConstraint(
+            frameAbar=plant.world_frame(),
+            R_AbarA=X_WG.rotation(),
+            frameBbar=G_body.body_frame(),
+            R_BbarB=RotationMatrix(),
+            theta_bound=1 * np.pi / 180,
+        )
+
+        ik.AddMinimumDistanceLowerBoundConstraint(0.01)
+
+        for count in range(max_tries):
+            # TODO: Compute a random initial guess here, within the joint limits of the robot
+            q_guess = plant.GetPositions(plant_ctx, plant.GetModelInstanceByName(iiwa_name))
+            print(q_guess)
+            lower_jl, upper_jl = plant.GetPositionLowerLimits(), plant.GetPositionUpperLimits()
+            for i in range(len(q_variables)):
+                if q_guess[i] > lower_jl[i] and q_guess[i] < upper_jl[i]:
+                    continue
+                if np.isinf(lower_jl[i]):
+                    lower_jl[i] = -np.pi
+                if np.isinf(upper_jl[i]):
+                    upper_jl[i] = np.pi
+                q_guess[i] = np.random.uniform(lower_jl[i], upper_jl[i])
+            
+            prog.SetInitialGuess(q_variables, q_guess)
+
+            result = Solve(prog)
+            print("reall we failed here?")
+
+            if result.is_success():
+                print("Succeeded in %d tries!" % (count + 1))
+                q_full = result.GetSolution(q_variables)
+                # Extract this arm's 7 DoF in a consistent order using the same plant
+                plant.SetPositions(plant_ctx, q_full)
+                iiwa_model = plant.GetModelInstanceByName(iiwa_name)
+                return plant.GetPositions(plant_ctx, iiwa_model)
+
+        print("Failed!")
+        return None
+
+    # Minimal differential-IK segment runner for small incremental motions
+    def diffik(
+        poses: list[RigidTransform],
+        times: list[float],
+        iiwa_name: str,
+        wsg_name: str,
+        finger_values: np.ndarray | None = None,
+        q0: np.ndarray | None = None,
+    ) -> None:
+        builder = DiagramBuilder()
+        station = MakeHardwareStation(LoadScenario(data=scenario_yaml), meshcat)
+        builder.AddSystem(station)
+        plant_local = station.plant()
+        traj_pos = PiecewisePose.MakeLinear(times, poses)
+        traj_VG = traj_pos.MakeDerivative()
+        V_src = builder.AddSystem(TrajectorySource(traj_VG))
+        dik = builder.AddSystem(PseudoInverseController(plant=plant_local, iiwa_model_name=iiwa_name, wsg_model_name=wsg_name))
+        integ = builder.AddSystem(Integrator(7))
+        builder.Connect(V_src.get_output_port(), dik.get_input_port(0))
+        builder.Connect(dik.get_output_port(), integ.get_input_port())
+        builder.Connect(integ.get_output_port(), station.GetInputPort(f"{iiwa_name}.position"))
+        builder.Connect(station.GetOutputPort(f"{iiwa_name}.position_measured"), dik.get_input_port(1))
+        # Optional gripper position profile
+        if finger_values is not None:
+            wsg_src = builder.AddSystem(TrajectorySource(PiecewisePolynomial.FirstOrderHold(times, finger_values)))
+            builder.Connect(wsg_src.get_output_port(), station.GetInputPort(f"{wsg_name}.position"))
+        # Keep the other arm stiff and its gripper open
+        other_iiwa = "iiwa_right" if iiwa_name == "iiwa_left" else "iiwa_left"
+        other_wsg = "wsg_right" if wsg_name == "wsg_left" else "wsg_left"
+        builder.Connect(station.GetOutputPort(f"{other_iiwa}.position_measured"), station.GetInputPort(f"{other_iiwa}.position"))
+        opened = 0.107
+        builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([opened]))).get_output_port(),
+                        station.GetInputPort(f"{other_wsg}.position"))
+        # Increase force limits
+        try:
+            builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([600.0]))).get_output_port(),
+                            station.GetInputPort(f"{wsg_name}.force_limit"))
+            builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([600.0]))).get_output_port(),
+                            station.GetInputPort(f"{other_wsg}.force_limit"))
+        except Exception:
+            pass
+        diagram = builder.Build()
+        sim = Simulator(diagram)
+        # Initialize integrator state
+        ctx = sim.get_mutable_context()
+        if q0 is None:
+            q0 = plant_local.GetPositions(plant_local.GetMyContextFromRoot(ctx), plant_local.GetModelInstanceByName(iiwa_name))
+        integ.GetMyContextFromRoot(ctx).get_mutable_continuous_state_vector().SetFromVector(q0)
+        sim.set_target_realtime_rate(1.0)
+        sim.Initialize()
+        sim.AdvanceTo(times[-1])
+
+    # --------- Analytic antipodal grasp for a box in its own frame (O) ----------
+    def compute_antipodal_grasp_box_O(
+        size_oxo: list[float] | np.ndarray,
+        prefer_axis: str | None = None,
+        finger_clearance_m: float = 0.10,
+    ) -> RigidTransform:
+        """
+        Construct an analytic antipodal top-down pinch grasp for an axis-aligned box in object frame O.
+        Gripper G axes:
+          - x_G: closing direction, aligned with +e_x (pinch on ±X faces) or +e_y (pinch on ±Y faces).
+          - y_G: -e_z (approach downwards in world after composing with X_WO).
+          - z_G: x_G × y_G (right-hand).
+        G origin at box center, then offset by -finger_clearance along G.y (i.e., +z_O) to be above the part.
+        """
+        sx, sy, sz = float(size_oxo[0]), float(size_oxo[1]), float(size_oxo[2])
+        # choose pinch axis (default to smaller horizontal extent; tie -> x)
+        axis = prefer_axis if prefer_axis in ("x", "y") else ("x" if sx <= sy else "y")
+        if axis == "y":
+            xg_o = np.array([0.0, 1.0, 0.0])
+        else:
+            xg_o = np.array([1.0, 0.0, 0.0])
+        yg_o = np.array([0.0, 0.0, -1.0])
+        zg_o = np.cross(xg_o, yg_o); zg_o /= np.linalg.norm(zg_o)
+        yg_o = np.cross(zg_o, xg_o)  # re-orthogonalize
+        R_OG = RotationMatrix(np.column_stack((xg_o, yg_o, zg_o)))
+        p_OG_o = np.zeros(3)
+        # offset along -y_G (i.e., +z_O) to create a hover/clearance
+        return RigidTransform(R_OG, p_OG_o) @ RigidTransform([0.0, -abs(finger_clearance_m), 0.0])
+    def place(X_WO: RigidTransform, X_WGoal: RigidTransform, sim_duration: float = 8.0):
+        """
+        Basic pick/place using a minimal DIK controller.
+        - Chooses the nearer arm by XY distance to the brick.
+        - Builds a simple hover -> grasp -> hover -> goal-hover -> goal -> goal-hover waypoint trajectory.
+        - Wires DIK, runs a short sim.
+        """
+        # Build a fresh station/diagram for the motion
+        builder_local = DiagramBuilder()
+        station_local = MakeHardwareStation(LoadScenario(data=scenario_yaml), meshcat)
+        builder_local.AddSystem(station_local)
+        plant = station_local.plant()
+        # Choose arm by proximity
+        p = np.array(X_WO.translation())
+        left_base = np.array([0.65, 0.0])
+        right_base = np.array([-0.65, 0.0])
+        use_left = np.linalg.norm(p[:2] - left_base) <= np.linalg.norm(p[:2] - right_base)
+        iiwa_name = "iiwa_left" if use_left else "iiwa_right"
+        wsg_name = "wsg_left" if use_left else "wsg_right"
+
+        # Waypoints (use analytic antipodal grasp for the box)
+        hover = 0.18
+        X_WGinitial = plant.EvalBodyPoseInWorld(plant.GetMyContextFromRoot(station_local.CreateDefaultContext()), plant.GetBodyByName("body", plant.GetModelInstanceByName(wsg_name)))
+        X_OG = compute_antipodal_grasp_box_O(brick_size)
+        X_grasp = X_WO @ X_OG
+        X_hover = RigidTransform(X_grasp.rotation(), X_grasp.translation() + np.array([0.0, 0.0, hover]))
+        X_WGgoal = X_WGoal @ X_OG 
+        X_WGgoal_hover = RigidTransform(X_WGgoal.rotation(), X_WGgoal.translation() + np.array([0.0, 0.0, hover]))
+        X_Gs = [X_WGinitial, X_hover, X_grasp, X_grasp, X_grasp, X_hover, X_WGgoal_hover, X_WGgoal, X_WGgoal_hover]
+        # Use DIK only for: prepick->grasp (1->2), grasp->postpick (4->5), preplace->place (6->7), place->postplace (7->8).
+        # Zero-out other segments by making consecutive poses equal, so traj derivative is zero there.
+        X_Gs_dik = list(X_Gs)
+        # initial->prepick: hold (no DIK)
+        X_Gs_dik[1] = X_Gs_dik[0]
+        # postpick->preplace: hold (no DIK)
+        X_Gs_dik[6] = X_Gs_dik[5]
+        sample_times = [0, 1.5, 3.0, 4.0, 5.0, 6.5, 9, 10.5, 12]
+        # Gripper (open/close) profile
+        opened = 0.107
+        closed = 0.0
+        finger_values = np.asarray([opened, opened, opened, closed, closed, closed, closed, opened, opened]).reshape(1, -1)
+
+        # Visualize the full high-level path
+        traj_pos_vis = PiecewisePose.MakeLinear(sample_times, X_Gs)
+        all_samples = 40
+        t_grid = np.linspace(sample_times[0], sample_times[-1], all_samples)
+        for j, tj in enumerate(t_grid):
+            Xj = traj_pos_vis.GetPose(tj)
+            AddMeshcatTriad(meshcat, f"debug/dik_path/all_{j}", X_PT=Xj, length=0.05, radius=0.002)
+
+        # 1) IK: initial -> prepick hover
+        q_pre_pick = solve_ik(X_hover, iiwa_name=iiwa_name, wsg_name=wsg_name)
+        # 2) DIK: prepick -> grasp -> postpick
+        poses_pick = [X_hover, X_grasp, X_grasp, X_hover]
+        times_pick = [0.0, 1.5, 3.0, 4.0]
+        fingers_pick = np.asarray([opened, opened, closed, closed]).reshape(1, -1)
+        diffik(poses_pick, times_pick, iiwa_name, wsg_name, fingers_pick, q0=q_pre_pick if q_pre_pick is not None else None)
+        # 3) IK: postpick -> preplace hover
+        q_pre_place = solve_ik(X_WGgoal_hover, iiwa_name=iiwa_name, wsg_name=wsg_name)
+        # 4) DIK: preplace -> place -> postplace
+        poses_place = [X_WGgoal_hover, X_WGgoal, X_WGgoal_hover]
+        times_place = [0.0, 1.5, 3.0]
+        fingers_place = np.asarray([closed, closed, opened]).reshape(1, -1)
+        diffik(poses_place, times_place, iiwa_name, wsg_name, fingers_place, q0=q_pre_place if q_pre_place is not None else None)
+
     # Build base of scenario (robots, grippers, cameras frames/boxes); bricks/table appended below.
     scenario_yaml_base = f"""directives:
     - add_model:
         name: iiwa_left
         file: package://drake_models/iiwa_description/urdf/iiwa14_primitive_collision.urdf
         default_joint_positions:
-            iiwa_joint_1: [0]
-            iiwa_joint_2: [0]
+            iiwa_joint_1: [-1.57]
+            iiwa_joint_2: [0.1]
             iiwa_joint_3: [0]
-            iiwa_joint_4: [0]
+            iiwa_joint_4: [-1.2]
             iiwa_joint_5: [0]
-            iiwa_joint_6: [0]
+            iiwa_joint_6: [ 1.6]
             iiwa_joint_7: [0]
     - add_weld:
         parent: world
         child: iiwa_left::iiwa_link_0
         X_PC:
-            translation: [0.8, 0, 0]
+            translation: [0.65, 0, 0]
 
     - add_model:
         name: wsg_left
@@ -100,18 +377,18 @@ if __name__ == "__main__":
         name: iiwa_right
         file: package://drake_models/iiwa_description/urdf/iiwa14_primitive_collision.urdf
         default_joint_positions:
-            iiwa_joint_1: [0]
-            iiwa_joint_2: [0]
+            iiwa_joint_1: [-1.57]
+            iiwa_joint_2: [0.1]
             iiwa_joint_3: [0]
-            iiwa_joint_4: [0]
+            iiwa_joint_4: [-1.2]
             iiwa_joint_5: [0]
-            iiwa_joint_6: [0]
+            iiwa_joint_6: [ 1.6]
             iiwa_joint_7: [0]
     - add_weld:
         parent: world
         child: iiwa_right::iiwa_link_0
         X_PC:
-            translation: [-0.8, 0, 0]
+            translation: [-0.65, 0, 0]
 
     - add_model:
         name: wsg_right
@@ -129,7 +406,7 @@ if __name__ == "__main__":
         X_PF:
             base_frame: world
             rotation: !Rpy {{ deg: [-120.0, 0.0, 180.0]}}
-            translation: [0, 1.4, 0.5]
+            translation: [0, 2.0, 1.0]
     - add_model:
         name: camera0
         file: package://manipulation/camera_box.sdf
@@ -142,7 +419,7 @@ if __name__ == "__main__":
         X_PF:
             base_frame: world
             rotation: !Rpy {{ deg: [-120.0, 0.0, 90.0]}}
-            translation: [1.4, 0.0, 0.5]
+            translation: [2.0, 0.0, 1.0]
     - add_model:
         name: camera1
         file: package://manipulation/camera_box.sdf
@@ -155,7 +432,7 @@ if __name__ == "__main__":
         X_PF:
             base_frame: world
             rotation: !Rpy {{ deg: [-120.0, 0.0, -90.0]}}
-            translation: [-1.4, 0, 0.5]
+            translation: [-2.0, 0, 1.0]
     - add_model:
         name: camera2
         file: package://manipulation/camera_box.sdf
@@ -168,7 +445,7 @@ if __name__ == "__main__":
         X_PF:
             base_frame: world
             rotation: !Rpy {{ deg: [-120.0, 0.0, 0.0]}}
-            translation: [0, -1.4, 0.5]
+            translation: [0, -2.0, 1.0]
     - add_model:  
         name: camera3
         file: package://manipulation/camera_box.sdf
@@ -191,13 +468,14 @@ if __name__ == "__main__":
 """
 
     # Define brick geometry and write SDFs (single-link box). Then add models with randomized poses.
-    brick_size = [0.2, 0.1, 0.06]   # x, y, z in meters
+    brick_size = [0.16, 0.08, 0.04]   # x, y, z in meters
     num_bricks = 10
-    x_min, x_max = -0.9, 0.9
-    y_min, y_max = -0.35, 0.35
-    min_arm_clearance = 0.4
+    # Spawn bricks farther from the bases but not too far (within table bounds)
+    x_band_inner, x_band_outer = 0.6, 1.2
+    y_min, y_max = -0.6, 0.6
+    min_arm_clearance = 0.5
     min_brick_spacing = 0.25
-    arm_bases = np.array([[0.8, 0.0], [-0.8, 0.0]])
+    arm_bases = np.array([[0.65, 0.0], [-0.65, 0.0]])
     placed_xy = []
 
     def write_brick_sdf(path: Path, size_xyz):
@@ -219,8 +497,8 @@ if __name__ == "__main__":
         <geometry><box><size>{sx} {sy} {sz}</size></box></geometry>
         <drake:proximity_properties>
           <drake:rigid_hydroelastic/>
-          <drake:mu_static>0.90</drake:mu_static>
-          <drake:mu_dynamic>0.80</drake:mu_dynamic>
+          <drake:mu_static>2.00</drake:mu_static>
+          <drake:mu_dynamic>1.60</drake:mu_dynamic>
         </drake:proximity_properties>
       </collision>
       <visual name="visual">
@@ -232,116 +510,7 @@ if __name__ == "__main__":
 """
         )
 
-    class PseudoInverseController(LeafSystem):
-        """
-        Differential IK: maps desired spatial velocity of the gripper V_WG (6) to
-        joint velocities v (7 for iiwa14) via damped least-squares Jacobian inverse.
-        Model and gripper body names are parameters to keep usage flexible.
-        """
-        def __init__(self, plant: MultibodyPlant, iiwa_model_name: str, gripper_body_name: str, damping: float = 1e-3, v_limit: float = 1.5):
-            LeafSystem.__init__(self)
-            self._plant = plant
-            self._plant_context = plant.CreateDefaultContext()
-            self._iiwa = plant.GetModelInstanceByName(iiwa_model_name)
-            self._G = plant.GetBodyByName("body", plant.GetModelInstanceByName(gripper_body_name)).body_frame()
-            self._W = plant.world_frame()
-            self._damping = damping
-            self._v_limit = v_limit  # rad/s cap per joint
-
-            # Assume iiwa14 joint names exist; use them to get a contiguous velocity block.
-            self._vel_start = plant.GetJointByName("iiwa_joint_1", self._iiwa).velocity_start()
-            self._vel_end = plant.GetJointByName("iiwa_joint_7", self._iiwa).velocity_start()
-            self._n_vel = self._vel_end - self._vel_start + 1
-
-            self.V_G_port = self.DeclareVectorInputPort("V_WG", 6)
-            self.q_port = self.DeclareVectorInputPort("iiwa.position", 7)
-            self.DeclareVectorOutputPort("iiwa.velocity", self._n_vel, self.CalcOutput)
-
-        def CalcOutput(self, context: Context, output: BasicVector):
-            V_WG = self.V_G_port.Eval(context)
-            q = self.q_port.Eval(context)
-            self._plant.SetPositions(self._plant_context, self._iiwa, q)
-
-            J = self._plant.CalcJacobianSpatialVelocity(
-                self._plant_context,
-                JacobianWrtVariable.kV,
-                self._G,
-                np.array([0.0, 0.0, 0.0]),
-                self._W,
-                self._W,
-            )
-            J = J[:, self._vel_start:self._vel_end + 1]
-
-            # Damped least squares: v = Jᵀ(JJᵀ + λ²I)⁻¹ V
-            JJt = J @ J.T
-            lam2I = (self._damping ** 2) * np.eye(JJt.shape[0])
-            v = J.T @ np.linalg.solve(JJt + lam2I, V_WG)
-
-            # Velocity limiting (uniform scale if any component exceeds cap)
-            vmax = np.max(np.abs(v)) if v.size else 0.0
-            if vmax > self._v_limit:
-                v = (self._v_limit / vmax) * v
-            output.SetFromVector(v)
-
-    def place_from_pose(X_WO: RigidTransform, X_WGoal: RigidTransform, sim_duration: float = 12.0):
-        """
-        DEBUG: Pick/place using an ICP-estimated brick pose (no name lookup).
-        Implements a simple antipodal grasp on the box: approach from +Z of the object and close across Y.
-        """
-        local_builder = DiagramBuilder()
-        local_station = MakeHardwareStation(LoadScenario(data=scenario_yaml), meshcat)
-        local_builder.AddSystem(local_station)
-        plant = local_station.plant()
-        # Select arm by XY distance
-        p = X_WO.translation()
-        left_base = np.array([0.8, 0.0]); right_base = np.array([-0.8, 0.0])
-        use_left = np.linalg.norm(p[:2] - left_base) <= np.linalg.norm(p[:2] - right_base)
-        iiwa_name = "iiwa_left" if use_left else "iiwa_right"
-        wsg_name = "wsg_left" if use_left else "wsg_right"
-        # Antipodal grasp w.r.t. object frame: gripper Z along -Z_object, fingers across Y_object
-        R_WO = X_WO.rotation()
-        R_OG = RotationMatrix.MakeZRotation(np.pi) @ RotationMatrix.MakeXRotation(-np.pi/2)  # align fingers with +Y_O
-        X_WG_grasp = X_WO.multiply(RigidTransform(R_OG, [0.0, 0.0, brick_size[2] / 2.0 + 0.01]))
-        hover_offset = 0.18
-        X_WG_hover = RigidTransform(X_WG_grasp.rotation(), X_WG_grasp.translation() + np.array([0.0, 0.0, hover_offset]))
-        # Goal poses
-        p_goal_hover = X_WGoal.translation() + np.array([0.0, 0.0, hover_offset])
-        X_WG_goal_hover = RigidTransform(X_WGoal.rotation(), p_goal_hover)
-        X_WG_goal = X_WGoal
-        # Keyframes
-        X_Gs = [X_WG_hover, X_WG_grasp, X_WG_hover, X_WG_goal_hover, X_WG_goal, X_WG_goal_hover]
-        opened = 0.107; closed = 0.0
-        finger_values = np.asarray([opened, closed, closed, closed, opened, opened]).reshape(1, -1)
-        sample_times = [0, 2, 4, 7, 9, 11]
-        # Draw keyframes and path (debug)
-        for i, X in enumerate(X_Gs):
-            AddMeshcatTriad(meshcat, f"debug/icp_place/key_{i}", X_PT=X, length=0.12, radius=0.003)
-        traj_pos = PiecewisePose.MakeLinear(sample_times, X_Gs)
-        for s in range(len(sample_times) - 1):
-            t0, t1 = sample_times[s], sample_times[s + 1]
-            for j in range(1, 5):
-                t = t0 + j * (t1 - t0) / 5.0
-                pc_dot = PointCloud(1); pc_dot.mutable_xyzs()[:] = traj_pos.GetPose(t).translation().reshape(3, 1)
-                meshcat.SetObject(f"debug/icp_place/path_{s}_{j}", pc_dot, point_size=0.05, rgba=Rgba(1, 0, 0, 1))
-        # Wire DIK
-        V_G_source = local_builder.AddSystem(TrajectorySource(traj_pos.MakeDerivative()))
-        controller = local_builder.AddSystem(PseudoInverseController(plant=local_station.plant(), iiwa_model_name=iiwa_name, gripper_body_name=wsg_name))
-        integrator = local_builder.AddSystem(Integrator(7))
-        wsg_source = local_builder.AddSystem(TrajectorySource(PiecewisePolynomial.FirstOrderHold(sample_times, finger_values)))
-        local_builder.Connect(V_G_source.get_output_port(), controller.get_input_port(0))
-        local_builder.Connect(controller.get_output_port(), integrator.get_input_port())
-        local_builder.Connect(integrator.get_output_port(), local_station.GetInputPort(f"{iiwa_name}.position"))
-        local_builder.Connect(local_station.GetOutputPort(f"{iiwa_name}.position_measured"), controller.get_input_port(1))
-        local_builder.Connect(wsg_source.get_output_port(), local_station.GetInputPort(f"{wsg_name}.position"))
-        # Hold other arm
-        other_iiwa = "iiwa_right" if iiwa_name == "iiwa_left" else "iiwa_left"
-        other_wsg = "wsg_right" if wsg_name == "wsg_left" else "wsg_left"
-        local_builder.Connect(local_station.GetOutputPort(f"{other_iiwa}.position_measured"), local_station.GetInputPort(f"{other_iiwa}.position"))
-        local_builder.Connect(local_builder.AddSystem(ConstantVectorSource(np.array([0.107]))).get_output_port(), local_station.GetInputPort(f"{other_wsg}.position"))
-        # Sim
-        local_diagram = local_builder.Build()
-        sim = Simulator(local_diagram); sim.set_target_realtime_rate(1.0)
-        sim.Initialize(); sim.AdvanceTo(sim_duration)
+    
 
     def estimate_brick_poses_from_scene(
         scene_cloud: PointCloud,
@@ -435,8 +604,8 @@ if __name__ == "__main__":
             if comp_idx.size >= min_points:
                 clusters.append(comp_idx)
         # Known robot base locations to exclude spurious clusters near the pedestals.
-        left_base_xy = np.array([0.8, 0.0])
-        right_base_xy = np.array([-0.8, 0.0])
+        left_base_xy = np.array([0.65, 0.0])
+        right_base_xy = np.array([-0.65, 0.0])
         results: list[tuple[RigidTransform, float, int]] = []  # (pose, icp_err, num_points)
         # Prepare model points
         model_pts = model_cloud.xyzs()
@@ -498,7 +667,9 @@ if __name__ == "__main__":
         # rejection sampling for valid placement with clearances
         found = False
         for _ in range(200):
-            x = float(np.random.uniform(x_min, x_max))
+            # sample x in an outward band, symmetrically about the origin
+            sign = 1.0 if np.random.rand() > 0.5 else -1.0
+            x = float(sign * np.random.uniform(x_band_inner, x_band_outer))
             y = float(np.random.uniform(y_min, y_max))
             if np.min(np.hypot(x - arm_bases[:, 0], y - arm_bases[:, 1])) < min_arm_clearance:
                 continue
@@ -616,6 +787,18 @@ model_drivers:
         builder.AddSystem(ConstantVectorSource(np.array([0.107]))).get_output_port(),
         station.GetInputPort("wsg_right.position"),
     )
+    # Increase grasp force limits to reduce slipping (if ports exist)
+    try:
+        builder.Connect(
+            builder.AddSystem(ConstantVectorSource(np.array([200.0]))).get_output_port(),
+            station.GetInputPort("wsg_left.force_limit"),
+        )
+        builder.Connect(
+            builder.AddSystem(ConstantVectorSource(np.array([200.0]))).get_output_port(),
+            station.GetInputPort("wsg_right.force_limit"),
+        )
+    except Exception:
+        pass
 
     diagram = builder.Build()
 
@@ -641,7 +824,7 @@ model_drivers:
         cropped = PointCloud(int(np.sum(keep)))
         cropped.mutable_xyzs()[:] = merged.xyzs()[:, keep]
         # Optional: visualize merged/cropped scene cloud
-        meshcat.SetObject("debug/icp/scene_cropped", cropped, point_size=0.02)
+        # meshcat.SetObject("debug/icp/scene_cropped", cropped, point_size=0.02)
 
         # Downsample for faster ICP
         scene_cloud = cropped.VoxelizedDownSample(0.01)
@@ -666,7 +849,7 @@ model_drivers:
             return model
 
         model_cloud = sample_box_surface(brick_size, num_samples=2500)
-        meshcat.SetObject("debug/icp/model_cloud", model_cloud, point_size=0.02)
+        # meshcat.SetObject("debug/icp/model_cloud", model_cloud, point_size=0.02)
 
         # Initial guess: put model at the scene centroid, identity rotation
         centroid = np.mean(scene_cloud.xyzs(), axis=1)
@@ -684,8 +867,8 @@ model_drivers:
         )
         
         # Show the aligned model
-        meshcat.SetTransform("debug/icp/aligned_pose", X_brick_est)
-        meshcat.SetObject("debug/icp/aligned_pc", model_cloud, point_size=0.03)
+        # meshcat.SetTransform("debug/icp/aligned_pose", X_brick_est)
+        # meshcat.SetObject("debug/icp/aligned_pc", model_cloud, point_size=0.03)
         AddMeshcatTriad(meshcat, "debug/icp/pose", X_PT=X_brick_est, length=0.1, radius=0.003)
 
         # Multi-brick estimation via clustering + ICP, then run place on the first target
@@ -705,9 +888,7 @@ model_drivers:
         if len(poses) > 0:
             X_first = poses[0]
             print(len(poses), "poses")
-            X_goal = RigidTransform(X_first.rotation(), X_first.translation() + np.array([0.20, 0.0, 0.0]))
-            print("X_first:", X_first)
-            print("X_goal:", X_goal)
+            X_goal = RigidTransform(X_first.rotation(), np.array([0.0, 0.0, X_first.translation()[2]]))
             # DEBUG: overlay ICP poses as translucent red rectangular prisms (brick-sized)
             brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
             meshcat.SetObject("debug/icp_multi/X_first_box", brick_box, Rgba(1, 0, 0, 0.4))  # red
@@ -716,7 +897,7 @@ model_drivers:
             meshcat.SetTransform("debug/icp_multi/X_goal_box", X_goal)
             AddMeshcatTriad(meshcat, "debug/icp_multi/X_first_tri", X_PT=X_first, length=0.12, radius=0.003)
             AddMeshcatTriad(meshcat, "debug/icp_multi/X_goal_tri", X_PT=X_goal, length=0.12, radius=0.003)
-            place_from_pose(X_first, X_goal, sim_duration=12.0)
+            place(X_first, X_goal, sim_duration=12.0)
         else:
             print("ICP clustering found no bricks.")
     except Exception as e:
