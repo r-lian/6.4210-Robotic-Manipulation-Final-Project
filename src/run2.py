@@ -238,56 +238,71 @@ if __name__ == "__main__":
         # ---- Get controller + gripper command ports that were exported at build time ----
         if "left" in iiwa_name:
             V_G_port = diagram.GetInputPort("V_G_left_cmd")
+            wsg_port_cmd = diagram.GetInputPort("wsg_left.position")
             diagram.GetInputPort("iiwa_left.source_select").FixValue(ctx, [1])
-            # wsg_port_cmd = diagram.GetInputPort("wsg_left.position_cmd")
         else:
             V_G_port = diagram.GetInputPort("V_G_right_cmd")
+            wsg_port_cmd = diagram.GetInputPort("wsg_right.position")
             diagram.GetInputPort("iiwa_right.source_select").FixValue(ctx, [1])
-            # wsg_port_cmd = diagram.GetInputPort("wsg_right.position_cmd")
+
+        # CRITICAL: Initialize integrator state to current position before starting diffik
+        integrator_sys = integrator_left if "left" in iiwa_name else integrator_right
+        integrator_ctx = diagram.GetMutableSubsystemContext(integrator_sys, ctx)
+        integrator_sys.set_integral_value(integrator_ctx, q0)
 
         # Optional finger trajectory: interpolate scalar values over the same times
         finger_values_arr = None
         if finger_values is not None:
-            finger_values_arr = np.asarray(finger_values, dtype=float)
-            assert finger_values_arr.shape[1] == len(times), \
+            finger_values_arr = np.asarray(finger_values, dtype=float).flatten()
+            assert len(finger_values_arr) == len(times), \
                 "finger_values must have same length as times"
 
         # Publish once so visuals don't snap when we start moving
         diagram.ForcedPublish(ctx)
 
         # ---- Run diff IK loop: send V_WG(t), step the sim ----
-        simulator.set_target_realtime_rate(1.0)
         print("diff ik starting...")
         base_time = ctx.get_time()
 
-        counter = 0
-        for tk in times:
+        # Use smaller timesteps for smoother velocity commands
+        dt = 0.05  # 50ms timesteps for smoother tracking
+        num_steps = int((tf - t0) / dt) + 1
+        time_samples = np.linspace(t0, tf, num_steps)
+
+        print(f"Running diffik from t={t0} to t={tf} with {num_steps} steps")
+
+        # Temporarily reduce publish rate for speed (publish every N steps)
+        publish_interval = 5  # Only visualize every 5th step for speed
+
+        for i, tk in enumerate(time_samples):
             tk = float(tk)
             target_time = base_time + (tk - t0)
 
             # Spatial velocity command from trajectory
             V_WG = traj_VG.value(tk).ravel()   # shape (6,)
-            print(V_WG)
+            if i < 5 or i >= len(time_samples) - 3:  # print first and last few
+                print(f"Step {i}/{len(time_samples)}: t={tk:.2f}, V_WG[2]={V_WG[2]:.4f}")
             V_G_port.FixValue(ctx, V_WG)
 
             # Optional gripper command
             if finger_values_arr is not None:
                 finger_cmd = float(np.interp(tk, times, finger_values_arr))
-                # wsg_port_cmd.FixValue(ctx, [finger_cmd])
+                wsg_port_cmd.FixValue(ctx, [finger_cmd])
 
             simulator.AdvanceTo(target_time)
-            counter += 1
-            if counter > 3:
-                break
 
-        print(f"diff ik: {tf}\n")
+            # Publish visualization only periodically for speed
+            if i % publish_interval == 0 or i == len(time_samples) - 1:
+                diagram.ForcedPublish(ctx)
+
+        print(f"diff ik complete: {tf}\n")
 
     # Minimal joint-space polynomial interpolation to a target q
     def joint_poly_interp_to_q(
         q_target: np.ndarray | None,
         iiwa_name: str,
         wsg_name: str,
-        duration_s: float = 1.5,
+        duration_s: float = 0.8,  # Reduced from 1.5s for speed
         opened: float = 0.107,
     ) -> None:
         if q_target is None or q_target.shape[0] != 7:
@@ -300,12 +315,31 @@ if __name__ == "__main__":
         q_now = plant.GetPositions(plant_ctx, iiwa_model)
         t0 = ctx.get_time()
         tf = t0 + float(duration_s)
-        q_traj = PiecewisePolynomial.CubicShapePreserving([t0, tf], np.column_stack([q_now, q_target]), True)
+
+        # Use CubicWithContinuousAcceleration for smoother motion with constrained acceleration
+        # Set zero velocity at start and end to minimize acceleration spikes
+        q_traj = PiecewisePolynomial.CubicWithContinuousSecondDerivatives(
+            [t0, tf],
+            np.column_stack([q_now, q_target]),
+            np.zeros(7),  # zero velocity at start
+            np.zeros(7)   # zero velocity at end
+        )
         source = iiwa_left_trajectory_source if iiwa_name == "iiwa_left" else iiwa_right_trajectory_source
         source.UpdateTrajectory(q_traj)
         diagram.GetInputPort(f"{iiwa_name}.source_select").FixValue(ctx, [0])
 
-        simulator.AdvanceTo(tf)
+        # Set gripper position
+        wsg_port = diagram.GetInputPort(f"{wsg_name}.position")
+        wsg_port.FixValue(ctx, [opened])
+
+        # Step through with periodic publishing for speed
+        num_steps = 10  # Fixed number of intermediate steps
+        dt_step = (tf - t0) / num_steps
+        for i in range(num_steps + 1):
+            t_next = t0 + i * dt_step
+            simulator.AdvanceTo(t_next)
+            if i % 3 == 0:  # Publish every 3rd step
+                diagram.ForcedPublish(ctx)
 
 
     # --------- Analytic antipodal grasp for a box in its own frame (O) ----------
@@ -370,23 +404,69 @@ if __name__ == "__main__":
 
         # 1) IK: initial -> prepick hover
         q_pre_pick = solve_ik(X_hover, iiwa_name=iiwa_name, wsg_name=wsg_name)
-        joint_poly_interp_to_q(q_pre_pick, iiwa_name, wsg_name, duration_s=1.5, opened=opened)
+        joint_poly_interp_to_q(q_pre_pick, iiwa_name, wsg_name, duration_s=0.8, opened=opened)
 
-        # 2) DIK: prepick -> grasp -> postpick
+        # 2) DIK: prepick -> grasp -> postpick (faster timing)
         poses_pick = [X_hover, X_grasp, X_grasp, X_hover]
-        times_pick = [0.0, 1.5, 3.0, 4.0]
+        times_pick = [0.0, 0.8, 1.2, 2.0]  # Reduced from [0.0, 1.5, 3.0, 4.0]
         fingers_pick = np.asarray([opened, opened, closed, closed]).reshape(1, -1)
-        diffik(poses_pick, times_pick, iiwa_name, wsg_name, None, q0=q_pre_pick if q_pre_pick is not None else None)
+        diffik(poses_pick, times_pick, iiwa_name, wsg_name, fingers_pick, q0=q_pre_pick if q_pre_pick is not None else None)
         
-        # # 3) IK: postpick -> preplace hover
-        # q_pre_place = solve_ik(X_WGgoal_hover, iiwa_name=iiwa_name, wsg_name=wsg_name)
-        # # Polynomial interpolate joints to the preplace hover
-        # joint_poly_interp_to_q(q_pre_place, iiwa_name, wsg_name, duration_s=1.5, opened=opened)
-        # # 4) DIK: preplace -> place -> postplace
-        # poses_place = [X_WGgoal_hover, X_WGgoal, X_WGgoal_hover]
-        # times_place = [0.0, 1.5, 3.0]
-        # fingers_place = np.asarray([closed, closed, opened]).reshape(1, -1)
-        # diffik(poses_place, times_place, iiwa_name, wsg_name, fingers_place, q0=q_pre_place if q_pre_place is not None else None)
+        # 3) IK: postpick -> preplace hover
+        q_pre_place = solve_ik(X_WGgoal_hover, iiwa_name=iiwa_name, wsg_name=wsg_name)
+        # Polynomial interpolate joints to the preplace hover (keep gripper closed!)
+        # Slower duration for smoother transport with held brick
+        joint_poly_interp_to_q(q_pre_place, iiwa_name, wsg_name, duration_s=1.5, opened=closed)
+        # 4) DIK: preplace -> place -> postplace
+        poses_place = [X_WGgoal_hover, X_WGgoal, X_WGgoal, X_WGgoal_hover]
+        times_place = [0.0, 0.8, 1.2, 2.0]  # Reduced from [0.0, 1.5, 3.0]
+        fingers_place = np.asarray([closed, closed, opened, opened]).reshape(1, -1)
+        diffik(poses_place, times_place, iiwa_name, wsg_name, fingers_place, q0=q_pre_place if q_pre_place is not None else None)
+
+        # Reset inputs and trajectories to clean state after place operation
+        ctx = simulator.get_mutable_context()
+        plant = station.plant()
+        plant_ctx = plant.GetMyContextFromRoot(ctx)
+
+        # Get current joint positions for both arms
+        iiwa_left_model = plant.GetModelInstanceByName("iiwa_left")
+        iiwa_right_model = plant.GetModelInstanceByName("iiwa_right")
+        q_left_current = plant.GetPositions(plant_ctx, iiwa_left_model)
+        q_right_current = plant.GetPositions(plant_ctx, iiwa_right_model)
+
+        # Return to initial positions (defined in scenario YAML) instead of holding at current
+        t_now = ctx.get_time()
+        t_reset = t_now + 2.0  # 2 seconds to return to initial position
+
+        # Use smooth cubic trajectory back to initial positions with zero velocity at endpoints
+        q_left_return = PiecewisePolynomial.CubicWithContinuousSecondDerivatives(
+            [t_now, t_reset],
+            np.column_stack([q_left_current, qL0]),
+            np.zeros(7),  # zero velocity at start
+            np.zeros(7)   # zero velocity at end
+        )
+        q_right_return = PiecewisePolynomial.CubicWithContinuousSecondDerivatives(
+            [t_now, t_reset],
+            np.column_stack([q_right_current, qR0]),
+            np.zeros(7),  # zero velocity at start
+            np.zeros(7)   # zero velocity at end
+        )
+
+        # Update trajectory sources to return to initial positions
+        iiwa_left_trajectory_source.UpdateTrajectory(q_left_return)
+        iiwa_right_trajectory_source.UpdateTrajectory(q_right_return)
+
+        # Reset to trajectory source mode (not diffik mode)
+        diagram.GetInputPort("iiwa_left.source_select").FixValue(ctx, [0])
+        diagram.GetInputPort("iiwa_right.source_select").FixValue(ctx, [0])
+
+        # Reset velocity commands to zero
+        diagram.GetInputPort("V_G_left_cmd").FixValue(ctx, np.zeros(6))
+        diagram.GetInputPort("V_G_right_cmd").FixValue(ctx, np.zeros(6))
+
+        # Reset grippers to open position
+        diagram.GetInputPort("wsg_left.position").FixValue(ctx, [opened])
+        diagram.GetInputPort("wsg_right.position").FixValue(ctx, [opened])
 
     # Build base of scenario (robots, grippers, cameras frames/boxes); bricks/table appended below.
     scenario_yaml_base = f"""directives:
@@ -449,8 +529,8 @@ if __name__ == "__main__":
         name: camera0_origin
         X_PF:
             base_frame: world
-            rotation: !Rpy {{ deg: [-120.0, 0.0, 180.0]}}
-            translation: [0, 2.0, 1.0]
+            rotation: !Rpy {{ deg: [-130.0, 0.0, 180.0]}}
+            translation: [0, 2.5, 0.8]
     - add_model:
         name: camera0
         file: package://manipulation/camera_box.sdf
@@ -462,8 +542,8 @@ if __name__ == "__main__":
         name: camera1_origin
         X_PF:
             base_frame: world
-            rotation: !Rpy {{ deg: [-120.0, 0.0, 90.0]}}
-            translation: [2.0, 0.0, 1.0]
+            rotation: !Rpy {{ deg: [-130.0, 0.0, 90.0]}}
+            translation: [2.5, 0.0, 0.8]
     - add_model:
         name: camera1
         file: package://manipulation/camera_box.sdf
@@ -475,8 +555,8 @@ if __name__ == "__main__":
         name: camera2_origin
         X_PF:
             base_frame: world
-            rotation: !Rpy {{ deg: [-120.0, 0.0, -90.0]}}
-            translation: [-2.0, 0, 1.0]
+            rotation: !Rpy {{ deg: [-130.0, 0.0, -90.0]}}
+            translation: [-2.5, 0, 0.8]
     - add_model:
         name: camera2
         file: package://manipulation/camera_box.sdf
@@ -488,9 +568,9 @@ if __name__ == "__main__":
         name: camera3_origin
         X_PF:
             base_frame: world
-            rotation: !Rpy {{ deg: [-120.0, 0.0, 0.0]}}
-            translation: [0, -2.0, 1.0]
-    - add_model:  
+            rotation: !Rpy {{ deg: [-130.0, 0.0, 0.0]}}
+            translation: [0, -2.5, 0.8]
+    - add_model:
         name: camera3
         file: package://manipulation/camera_box.sdf
     - add_weld:
@@ -524,25 +604,30 @@ if __name__ == "__main__":
 
     def write_brick_sdf(path: Path, size_xyz):
         sx, sy, sz = size_xyz
+        # Compute inertia based on geometry: I = (1/12) * m * (h^2 + d^2) for each axis
+        mass = 0.1  # 100 grams (increased from 30g for more stability)
+        ixx = (1/12) * mass * (sy**2 + sz**2)
+        iyy = (1/12) * mass * (sx**2 + sz**2)
+        izz = (1/12) * mass * (sx**2 + sy**2)
         path.write_text(
             f"""<?xml version="1.0"?>
 <sdf xmlns:drake="drake.mit.edu" version="1.7">
   <model name="brick_model">
     <link name="brick_link">
       <inertial>
-        <mass>1.0</mass>
+        <mass>{mass}</mass>
         <inertia>
-          <ixx>0.001</ixx><ixy>0</ixy><ixz>0</ixz>
-          <iyy>0.001</iyy><iyz>0</iyz>
-          <izz>0.001</izz>
+          <ixx>{ixx:.6f}</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>{iyy:.6f}</iyy><iyz>0</iyz>
+          <izz>{izz:.6f}</izz>
         </inertia>
       </inertial>
       <collision name="collision">
         <geometry><box><size>{sx} {sy} {sz}</size></box></geometry>
         <drake:proximity_properties>
           <drake:rigid_hydroelastic/>
-          <drake:mu_static>2.00</drake:mu_static>
-          <drake:mu_dynamic>1.60</drake:mu_dynamic>
+          <drake:mu_static>1.0</drake:mu_static>
+          <drake:mu_dynamic>1.0</drake:mu_dynamic>
         </drake:proximity_properties>
       </collision>
       <visual name="visual">
@@ -799,9 +884,10 @@ model_drivers:
     builder = DiagramBuilder()
     builder.AddSystem(station)
     # Add point cloud outputs for the cameras (for ICP)
+    # IMPORTANT: Pass meshcat=None to disable continuous point cloud visualization (huge speedup!)
     try:
         to_point_cloud = AddPointClouds(
-            scenario=scenario, station=station, builder=builder, meshcat=meshcat
+            scenario=scenario, station=station, builder=builder, meshcat=None
         )
         builder.ExportOutput(to_point_cloud["camera0"].get_output_port(), "camera_point_cloud0")
         builder.ExportOutput(to_point_cloud["camera1"].get_output_port(), "camera_point_cloud1")
@@ -925,16 +1011,9 @@ model_drivers:
     builder.ExportInput(iiwa_right_switch.get_input_port(2), "iiwa_right.source_select")
 
 
-    # WSG position hold
-
-    builder.Connect(
-        builder.AddSystem(ConstantVectorSource(np.array([0.107]))).get_output_port(),
-        station.GetInputPort("wsg_left.position"),
-    )
-    builder.Connect(
-        builder.AddSystem(ConstantVectorSource(np.array([0.107]))).get_output_port(),
-        station.GetInputPort("wsg_right.position"),
-    )
+    # WSG gripper control - export input ports for control
+    builder.ExportInput(station.GetInputPort("wsg_left.position"), "wsg_left.position")
+    builder.ExportInput(station.GetInputPort("wsg_right.position"), "wsg_right.position")
 
     diagram = builder.Build()
 
@@ -943,18 +1022,29 @@ model_drivers:
     graphs[0].write_png("diagram.png")
 
     simulator = Simulator(diagram)
-    simulator.set_target_realtime_rate(10)
+    simulator.set_target_realtime_rate(0.0)  # 0 = as fast as possible!
+
+    # Speed up simulation by using larger max timestep
+    integrator = simulator.get_mutable_integrator()
+    integrator.set_maximum_step_size(0.01)  # 10ms max timestep (default is often 1ms)
+    integrator.set_target_accuracy(1e-2)  # Relax accuracy for speed (default is 1e-3)
+
     # Seed switch modes to use trajectory sources (0) by default.
     ctx0 = simulator.get_mutable_context()
     diagram.GetInputPort("iiwa_left.source_select").FixValue(ctx0, 0)
     diagram.GetInputPort("iiwa_right.source_select").FixValue(ctx0, 0)
     diagram.GetInputPort("V_G_left_cmd").FixValue(ctx0, np.zeros(6))
     diagram.GetInputPort("V_G_right_cmd").FixValue(ctx0, np.zeros(6))
+    # Initialize grippers to open position
+    diagram.GetInputPort("wsg_left.position").FixValue(ctx0, [0.107])
+    diagram.GetInputPort("wsg_right.position").FixValue(ctx0, [0.107])
     simulator.Initialize()
 
     # ---------------- ICP -> antipodal grasp -> IK place ----------------
     context = simulator.get_mutable_context()
-    # Grab point clouds exposed on the diagram
+
+    print("Capturing point clouds for ICP (one-time only)...")
+    # Grab point clouds exposed on the diagram (only once, not continuously!)
     pc0 = diagram.GetOutputPort("camera_point_cloud0").Eval(context)
     pc1 = diagram.GetOutputPort("camera_point_cloud1").Eval(context)
     pc2 = diagram.GetOutputPort("camera_point_cloud2").Eval(context)
@@ -967,11 +1057,14 @@ model_drivers:
     keep = (z >= 0.02) & (z <= 0.25)
     cropped = PointCloud(int(np.sum(keep)))
     cropped.mutable_xyzs()[:] = merged.xyzs()[:, keep]
-    # Optional: visualize merged/cropped scene cloud
-    # meshcat.SetObject("debug/icp/scene_cropped", cropped, point_size=0.02)
+
+    # Optional: visualize merged/cropped scene cloud (only once for debugging)
+    # Uncomment next line if you want to see the point cloud in meshcat:
+    # meshcat.SetObject("debug/icp/scene_cropped", cropped, point_size=0.01, rgba=Rgba(0, 1, 0, 0.3))
 
     # Downsample for faster ICP
     scene_cloud = cropped.VoxelizedDownSample(0.01)
+    print(f"Point cloud captured: {scene_cloud.size()} points")
 
     # Build a simple model point cloud for our brick (box), centered at origin
     def sample_box_surface(size_xyz, num_samples=2000) -> PointCloud:
@@ -1029,20 +1122,65 @@ model_drivers:
         traceback.print_exc()
         poses = []
     print("poses:", len(poses))
-    if len(poses) > 0:
-        X_first = poses[0]
-        print(len(poses), "poses")
-        X_goal = RigidTransform(X_first.rotation(), np.array([0.0, 0.0, X_first.translation()[2]]))
-        # DEBUG: overlay ICP poses as translucent red rectangular prisms (brick-sized)
-        brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
-        meshcat.SetObject("debug/icp_multi/X_first_box", brick_box, Rgba(1, 0, 0, 0.4))  # red
-        meshcat.SetTransform("debug/icp_multi/X_first_box", X_first)
-        meshcat.SetObject("debug/icp_multi/X_goal_box", brick_box, Rgba(0, 0, 1, 0.4))  # blue
-        meshcat.SetTransform("debug/icp_multi/X_goal_box", X_goal)
-        AddMeshcatTriad(meshcat, "debug/icp_multi/X_first_tri", X_PT=X_first, length=0.12, radius=0.003)
-        AddMeshcatTriad(meshcat, "debug/icp_multi/X_goal_tri", X_PT=X_goal, length=0.12, radius=0.003)
-        place(X_first, X_goal, sim_duration=12.0)
+
+    # Define pyramid goal positions: 4-3-2-1 layers centered at (0, 0)
+    # Brick dimensions from brick_size
+    brick_x, brick_y, brick_z = brick_size
+    table_height = 0.0  # Table surface at z=0
+
+    X_goals = []
+    z_offset = table_height + brick_z / 2  # First layer: half-height above table
+
+    # Layer 1 (bottom): 4 bricks in a row along x-axis
+    for i in range(4):
+        x = (i - 1.5) * brick_x  # Centers at -1.5, -0.5, 0.5, 1.5 brick widths
+        y = 0.0
+        z = z_offset
+        X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
+
+    # Layer 2: 3 bricks, offset by half brick width
+    z_offset += brick_z
+    for i in range(3):
+        x = (i - 1.0) * brick_x  # Centers at -1.0, 0.0, 1.0 brick widths
+        y = 0.0
+        z = z_offset
+        X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
+
+    # Layer 3: 2 bricks
+    z_offset += brick_z
+    for i in range(2):
+        x = (i - 0.5) * brick_x  # Centers at -0.5, 0.5 brick widths
+        y = 0.0
+        z = z_offset
+        X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
+
+    # Layer 4 (top): 1 brick
+    z_offset += brick_z
+    X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([0.0, 0.0, z_offset])))
+
+    print(f"Generated {len(X_goals)} pyramid goal positions")
+
+    # Visualize all goal positions
+    brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
+    for idx, X_goal in enumerate(X_goals):
+        meshcat.SetObject(f"debug/pyramid/goal_{idx}", brick_box, Rgba(0, 0, 1, 0.3))
+        meshcat.SetTransform(f"debug/pyramid/goal_{idx}", X_goal)
+
+    # Pick and place each brick from detected poses to pyramid positions
+    if len(poses) >= len(X_goals):
+        print(f"Placing {len(X_goals)} bricks into pyramid...")
+        for idx, (X_source, X_goal) in enumerate(zip(poses[:len(X_goals)], X_goals)):
+            print(f"\n=== Brick {idx + 1}/{len(X_goals)} ===")
+            # Visualize source and goal for this brick
+            meshcat.SetObject(f"debug/brick_{idx}/source", brick_box, Rgba(1, 0, 0, 0.4))
+            meshcat.SetTransform(f"debug/brick_{idx}/source", X_source)
+            meshcat.SetObject(f"debug/brick_{idx}/goal", brick_box, Rgba(0, 1, 0, 0.4))
+            meshcat.SetTransform(f"debug/brick_{idx}/goal", X_goal)
+
+            # Execute pick and place
+            place(X_source, X_goal, sim_duration=12.0)
+            print(f"Brick {idx + 1} placed successfully")
     else:
-        print("ICP clustering found no bricks.")
+        print(f"Error: Found {len(poses)} bricks but need {len(X_goals)} for pyramid")
 
     time.sleep(30)
