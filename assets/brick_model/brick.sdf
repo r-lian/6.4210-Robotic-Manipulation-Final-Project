@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<sdf version="1.7">
+    <model name="brick">
+        <link name="brick_link">
+            <inertial>
+                <mass>0.1</mass>
+                <inertia>
+                    <ixx>0.001</ixx><ixy>0</ixy><ixz>0</ixz>
+                    <iyy>0.001</iyy><iyz>0</iyz>
+                    <izz>0.001</izz>
+                </inertia>
+            </inertial>
+            <collision name="collision">
+                <geometry><box><size>0.1 0.08 0.04</size></box></geometry>
+            </collision>
+            <visual name="visual">
+                <geometry><box><size>0.1 0.08 0.04</size></box></geometry>
+                <material><diffuse>0.8 0.3 0.1 1.0</diffuse></material>
+            </visual>
+        </link>
+    </model>
+</sdf>

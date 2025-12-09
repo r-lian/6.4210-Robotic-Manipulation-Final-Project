@@ -1,20 +1,30 @@
 <?xml version="1.0"?>
+<<<<<<< HEAD
 <sdf xmlns:drake="drake.mit.edu" version="1.7">
+=======
+<sdf version="1.7">
+>>>>>>> refs/remotes/origin/main
     <model name="table">
         <pose>0 0 0 0 0 0</pose>
         <link name="table_link">
             <inertial>
                 <mass>1.0</mass>
                 <inertia>
+<<<<<<< HEAD
                     <ixx>0.005833</ixx>
                     <ixy>0.0</ixy>
                     <ixz>0.0</ixz>
                     <iyy>0.005833</iyy>
                     <iyz>0.0</iyz>
+=======
+                    <ixx>0.005833</ixx><ixy>0.0</ixy><ixz>0.0</ixz>
+                    <iyy>0.005833</iyy><iyz>0.0</iyz>
+>>>>>>> refs/remotes/origin/main
                     <izz>0.005</izz>
                 </inertia>
             </inertial>
             <collision name="collision">
+<<<<<<< HEAD
                 <geometry>
                     <box>
                         <size>5 5 0.1</size>
@@ -36,6 +46,13 @@
                 <material>
                     <diffuse>1.0 1.0 1.0 1.0</diffuse>
                 </material>
+=======
+                <geometry><box><size>2 2 0.1</size></box></geometry>
+            </collision>
+            <visual name="visual">
+                <geometry><box><size>2 2 0.1</size></box></geometry>
+                <material><diffuse>1.0 1.0 1.0 1.0</diffuse></material>
+>>>>>>> refs/remotes/origin/main
             </visual>
         </link>
     </model>
