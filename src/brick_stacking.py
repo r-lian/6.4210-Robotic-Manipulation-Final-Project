@@ -105,7 +105,7 @@ directives:
         translation: [0.0, 0.0, -0.05]
         rotation: !Rpy {{ deg: [0, 0, -90] }}
 {brick_directives}
-# Add cameras
+# Add cameras (matching notebook)
 - add_frame:
     name: camera0_origin
     X_PF:
@@ -115,36 +115,48 @@ directives:
 - add_model:
     name: camera0
     file: package://manipulation/camera_box.sdf
-- add_frame:
-    name: camera0_origin
-    X_PF:
-        base_frame: camera0::base
+- add_weld:
+    parent: camera0_origin
+    child: camera0::base
+
 - add_frame:
     name: camera1_origin
     X_PF:
         base_frame: world
-        rotation: !Rpy {{ deg: [-120.0, 0.0, 60.0]}}
-        translation: [-0.4, 0.7, 0.5]
+        rotation: !Rpy {{ deg: [-125, 0.0, 90.0]}}
+        translation: [0.8, 0.1, 0.5]
 - add_model:
     name: camera1
     file: package://manipulation/camera_box.sdf
-- add_frame:
-    name: camera1_origin
-    X_PF:
-        base_frame: camera1::base
+- add_weld:
+    parent: camera1_origin
+    child: camera1::base
+
 - add_frame:
     name: camera2_origin
     X_PF:
         base_frame: world
-        rotation: !Rpy {{ deg: [-120.0, 0.0, -60.0]}}
-        translation: [0.4, 0.7, 0.5]
+        rotation: !Rpy {{ deg: [-120.0, 0.0, -90.0]}}
+        translation: [-0.8, 0.1, 0.5]
 - add_model:
     name: camera2
     file: package://manipulation/camera_box.sdf
+- add_weld:
+    parent: camera2_origin
+    child: camera2::base
+
 - add_frame:
-    name: camera2_origin
+    name: camera3_origin
     X_PF:
-        base_frame: camera2::base
+        base_frame: world
+        rotation: !Rpy {{ deg: [-120.0, 0.0, 0.0]}}
+        translation: [0, -0.8, 0.5]
+- add_model:
+    name: camera3
+    file: package://manipulation/camera_box.sdf
+- add_weld:
+    parent: camera3_origin
+    child: camera3::base
 
 model_drivers:
     iiwa: !IiwaDriver
@@ -167,27 +179,35 @@ cameras:
         depth: True
         X_PB:
             base_frame: camera2::base
+    camera3:
+        name: camera3
+        depth: True
+        X_PB:
+            base_frame: camera3::base
 """
 
 
-def detect_brick_with_icp(pc0, pc1, pc2, plant, plant_context, brick_name, brick_size, meshcat):
+def detect_brick_with_icp(pc0, pc1, pc2, pc3, plant, plant_context, brick_name, brick_size, meshcat):
     """Detect a brick using ICP."""
     # Get brick ground truth for cropping
     model_brick = plant.GetModelInstanceByName(brick_name)
     frame_brick = plant.GetFrameByName("brick_link", model_instance=model_brick)
     X_PC_brick = plant.CalcRelativeTransform(plant_context, plant.world_frame(), frame_brick)
 
-    # Crop around brick
-    brick_lower = X_PC_brick.translation() + np.array([-0.15, -0.15, -0.15])
-    brick_upper = X_PC_brick.translation() + np.array([0.15, 0.15, 0.15])
+    # Crop around brick - use larger region for better coverage
+    brick_lower = X_PC_brick.translation() + np.array([-0.20, -0.20, -0.20])
+    brick_upper = X_PC_brick.translation() + np.array([0.20, 0.20, 0.20])
 
     camera0_brick = pc0.Crop(brick_lower, brick_upper)
     camera1_brick = pc1.Crop(brick_lower, brick_upper)
     camera2_brick = pc2.Crop(brick_lower, brick_upper)
+    camera3_brick = pc3.Crop(brick_lower, brick_upper)
 
-    combined = Concatenate([camera0_brick, camera1_brick, camera2_brick])
-    downsampled = combined.VoxelizedDownSample(0.005)
-    brick_cloud = remove_table_points(downsampled)
+    combined = Concatenate([camera0_brick, camera1_brick, camera2_brick, camera3_brick])
+    # Remove table points BEFORE downsampling to preserve brick points
+    # Use 0mm threshold to keep all brick points (brick bottom is at ~1mm)
+    no_table = remove_table_points(combined, z_threshold=0.0)
+    brick_cloud = no_table.VoxelizedDownSample(0.005)
 
     print(f"{brick_name}: {brick_cloud.size()} points")
 
@@ -277,14 +297,15 @@ if __name__ == "__main__":
     brick_sdf_path = brick_dir / "brick.sdf"
     write_brick_sdf(brick_sdf_path, brick_size)
 
-    # Random brick positions
+    # Brick positions optimized for 4-camera coverage
+    # Centered at [-0.25, 0.0] for better FOV overlap
     np.random.seed(42)
     brick_positions = [
-        [-0.40, -0.15, np.random.uniform(0, np.pi)],
-        [-0.35, 0.15, np.random.uniform(0, np.pi)],
-        [-0.25, 0.0, np.random.uniform(0, np.pi)],
+        [-0.30, -0.20, np.random.uniform(0, np.pi)],
+        [-0.30, 0.20, np.random.uniform(0, np.pi)],
+        [-0.20, 0.0, np.random.uniform(0, np.pi)],
     ]
-    stack_location = [-0.50, 0.0]
+    stack_location = [-0.40, 0.0]
 
     print(f"Brick initial positions:")
     for i, pos in enumerate(brick_positions):
@@ -310,6 +331,7 @@ if __name__ == "__main__":
     builder.ExportOutput(to_point_cloud["camera0"].get_output_port(), "camera_point_cloud0")
     builder.ExportOutput(to_point_cloud["camera1"].get_output_port(), "camera_point_cloud1")
     builder.ExportOutput(to_point_cloud["camera2"].get_output_port(), "camera_point_cloud2")
+    builder.ExportOutput(to_point_cloud["camera3"].get_output_port(), "camera_point_cloud3")
 
     diagram = builder.Build()
     context = diagram.CreateDefaultContext()
@@ -317,17 +339,23 @@ if __name__ == "__main__":
     plant = station.plant()
     plant_context = diagram.GetSubsystemContext(plant, context)
 
-    # Get point clouds
+    # Get point clouds (for visualization)
     pc0 = diagram.GetOutputPort("camera_point_cloud0").Eval(context)
     pc1 = diagram.GetOutputPort("camera_point_cloud1").Eval(context)
     pc2 = diagram.GetOutputPort("camera_point_cloud2").Eval(context)
+    pc3 = diagram.GetOutputPort("camera_point_cloud3").Eval(context)
 
-    # Detect all 3 bricks
+    print(f"Point clouds captured: {pc0.size() + pc1.size() + pc2.size() + pc3.size()} total points")
+
+    # Use ground truth brick poses (skip ICP for now)
     brick_poses = []
     for i in range(1, 4):
         brick_name = f"brick{i}"
-        brick_pose = detect_brick_with_icp(pc0, pc1, pc2, plant, plant_context, brick_name, brick_size, meshcat)
+        model_brick = plant.GetModelInstanceByName(brick_name)
+        frame_brick = plant.GetFrameByName("brick_link", model_instance=model_brick)
+        brick_pose = plant.CalcRelativeTransform(plant_context, plant.world_frame(), frame_brick)
         brick_poses.append(brick_pose)
+        print(f"{brick_name}: Ground truth pose: {brick_pose.translation()}")
 
     # ========================================================================
     # CONTROL: Stack all bricks

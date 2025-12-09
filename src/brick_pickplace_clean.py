@@ -266,8 +266,8 @@ def design_grasp_pose(X_WO: RigidTransform) -> tuple[RigidTransform, RigidTransf
         @ RollPitchYaw(-np.pi / 2, 0, 0).ToRotationMatrix()
     )
     # Center gripper on brick (0 offset in X and Y)
-    # Z offset: places gripper above brick center for proper grasping
-    p_OG = [0.0, 0.0, 0.10]
+    # Z offset: brick_size[2]/2 + small clearance (brick is 40mm tall, so ~30mm above brick center)
+    p_OG = [0.0, 0.0, 0.03]
     X_OG = RigidTransform(R_OG, p_OG)
     X_WG = X_WO @ X_OG
     return X_OG, X_WG
