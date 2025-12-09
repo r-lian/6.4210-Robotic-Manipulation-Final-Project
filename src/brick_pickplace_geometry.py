@@ -160,18 +160,38 @@ def sample_box_surface(size_xyz, num_samples=2500) -> PointCloud:
     return pc
 
 
-def antipodal_grasp_for_box(size_xyz, clearance_m=0.10) -> RigidTransform:
-    sx, sy, _ = float(size_xyz[0]), float(size_xyz[1]), float(size_xyz[2])
-    # Pinch along the smaller of x/y; approach from +z_O
-    use_y = sy < sx
-    xg_o = np.array([0.0, 1.0, 0.0]) if use_y else np.array([1.0, 0.0, 0.0])
-    yg_o = np.array([0.0, 0.0, -1.0])
-    zg_o = np.cross(xg_o, yg_o)
-    zg_o /= np.linalg.norm(zg_o)
-    yg_o = np.cross(zg_o, xg_o)
-    R_OG = RotationMatrix(np.column_stack((xg_o, yg_o, zg_o)))
-    # Offset upward along -y_G (i.e., +z_O) by clearance
-    return RigidTransform(R_OG, [0.0, -abs(clearance_m), 0.0])
+def design_grasp_for_brick(X_WO: RigidTransform, size_xyz, clearance_m=0.10):
+    """Design grasp pose for brick similar to notebook's letter grasp."""
+    sx, sy, sz = size_xyz
+    # Grasp orientation: approach from above, pinch along shorter dimension
+    # Similar to notebook: RollPitchYaw(0, 0, pi) @ RollPitchYaw(-pi/2, 0, 0)
+    R_OG = (
+        RollPitchYaw(0, 0, np.pi).ToRotationMatrix()
+        @ RollPitchYaw(-np.pi / 2, 0, 0).ToRotationMatrix()
+    )
+    # Offset above brick center (similar to notebook's [0.07, 0.06, 0.12])
+    p_OG = [0.0, 0.0, sz/2.0 + clearance_m]
+    X_OG = RigidTransform(R_OG, p_OG)
+    X_WG = X_WO @ X_OG
+    return X_OG, X_WG
+
+
+def design_pregrasp_pose(X_WG: RigidTransform) -> RigidTransform:
+    """Pre-grasp: approach from behind (in -Y direction of gripper frame)."""
+    X_GGApproach = RigidTransform([0.0, -0.15, 0.0])  # 15cm back
+    return X_WG @ X_GGApproach
+
+
+def design_pregoal_pose(X_WG: RigidTransform) -> RigidTransform:
+    """Pre-goal: hover above goal position."""
+    X_GGApproach = RigidTransform([0.0, 0.0, -0.15])  # 15cm above
+    return X_WG @ X_GGApproach
+
+
+def design_postgoal_pose(X_WG: RigidTransform) -> RigidTransform:
+    """Post-goal: lift after placing."""
+    X_GGApproach = RigidTransform([0.0, 0.0, -0.15])  # 15cm above
+    return X_WG @ X_GGApproach
 
 
 def make_trajectories(X_Gs: list[RigidTransform], fingers: np.ndarray, ts: list[float]):
@@ -216,7 +236,8 @@ directives:
     parent: world
     child: iiwa::iiwa_link_0
     X_PC:
-        translation: [0.6, 0.0, 0.0]
+        translation: [0, -0.5, 0]
+        rotation: !Rpy {{ deg: [0, 0, 180]}}
 
 - add_model:
     name: wsg
@@ -242,7 +263,7 @@ directives:
     file: file://{brick_sdf_path.resolve()}
     default_free_body_pose:
         brick_link:
-            translation: [0.0, 0.0, {brick_size[2]/2.0 + 0.01}]
+            translation: [-0.3, 0.0, {brick_size[2]/2.0 + 0.01}]
             rotation: !Rpy {{ deg: [0.0, 0.0, {np.degrees(np.random.uniform(0.0, np.pi)):.1f}]}}
 
 - add_frame:
@@ -363,56 +384,141 @@ model_drivers:
     simulator.Initialize()
 
     # Perception: merge clouds, crop height, downsample, ICP brick
+    print("\n=== PERCEPTION PHASE ===")
     context = simulator.get_context()
     pc0 = diagram.GetOutputPort("camera_point_cloud0").Eval(context)
     pc1 = diagram.GetOutputPort("camera_point_cloud1").Eval(context)
     pc2 = diagram.GetOutputPort("camera_point_cloud2").Eval(context)
     pc3 = diagram.GetOutputPort("camera_point_cloud3").Eval(context)
+    print(f"Camera point cloud sizes: cam0={pc0.size()}, cam1={pc1.size()}, cam2={pc2.size()}, cam3={pc3.size()}")
+
     merged = Concatenate([pc0, pc1, pc2, pc3])
-    z = merged.xyzs()[2, :]
-    keep = (z >= 0.02) & (z <= 0.25)
+    print(f"Merged point cloud size: {merged.size()}")
+
+    # Filter by height (remove table) and by region (focus on brick area)
+    xyz = merged.xyzs()
+    z_keep = (xyz[2, :] >= 0.025) & (xyz[2, :] <= 0.15)  # Brick height range only
+
+    # Also filter by approximate brick location (brick should be around [-0.3, 0, 0])
+    # Create a loose bounding box
+    x_keep = (xyz[0, :] >= -0.7) & (xyz[0, :] <= -0.1)  # X range around brick
+    y_keep = (xyz[1, :] >= -0.4) & (xyz[1, :] <= 0.4)   # Y range around brick
+
+    keep = z_keep & x_keep & y_keep
     cropped = PointCloud(int(np.sum(keep)))
     cropped.mutable_xyzs()[:] = merged.xyzs()[:, keep]
-    scene_cloud = cropped.VoxelizedDownSample(0.01)
+    print(f"After spatial crop: {cropped.size()} points")
+
+    scene_cloud = cropped.VoxelizedDownSample(0.005)  # Smaller voxels for better accuracy
+    print(f"After downsampling (voxel_size=0.005): {scene_cloud.size()} points")
+
+    # Visualize scene point cloud (red)
+    meshcat.SetObject("debug/scene_cloud", scene_cloud, point_size=0.01, rgba=Rgba(1, 0, 0))
 
     model_cloud = sample_box_surface(brick_size, num_samples=2500)
-    # Initial guess at centroid
-    centroid = np.mean(scene_cloud.xyzs(), axis=1)
+    print(f"Model point cloud (brick surface): {model_cloud.size()} points")
+
+    # Initial guess at centroid - use median to be robust to outliers
+    xyz_points = scene_cloud.xyzs()
+    centroid = np.median(xyz_points, axis=1)
+
+    # Better initial guess: we know brick should be flat on table (no rotation)
+    # Start with identity rotation
     X_init = RigidTransform(RotationMatrix.Identity(), centroid)
-    X_brick_est, _ = IterativeClosestPoint(
+    print(f"ICP initial guess (median): xyz={centroid}")
+    print(f"Scene cloud bounds: x=[{xyz_points[0,:].min():.3f}, {xyz_points[0,:].max():.3f}], "
+          f"y=[{xyz_points[1,:].min():.3f}, {xyz_points[1,:].max():.3f}], "
+          f"z=[{xyz_points[2,:].min():.3f}, {xyz_points[2,:].max():.3f}]")
+
+    # Visualize model cloud at initial position (green)
+    model_at_init = PointCloud(model_cloud.size())
+    model_at_init.mutable_xyzs()[:] = X_init.rotation() @ model_cloud.xyzs() + X_init.translation().reshape(3, 1)
+    meshcat.SetObject("debug/model_cloud_init", model_at_init, point_size=0.01, rgba=Rgba(0, 1, 0))
+
+    print("\nRunning ICP (max 60 iterations)...")
+    X_brick_est, icp_error = IterativeClosestPoint(
         p_Om=model_cloud.xyzs(), p_Ws=scene_cloud.xyzs(), X_Ohat=X_init, meshcat=meshcat, max_iterations=60
     )
+
+    # Visualize final aligned model cloud (blue)
+    model_aligned = PointCloud(model_cloud.size())
+    model_aligned.mutable_xyzs()[:] = X_brick_est.rotation() @ model_cloud.xyzs() + X_brick_est.translation().reshape(3, 1)
+    meshcat.SetObject("debug/model_cloud_aligned", model_aligned, point_size=0.01, rgba=Rgba(0, 0, 1))
+
     AddMeshcatTriad(meshcat, "debug/icp_brick_pose", X_PT=X_brick_est, length=0.12, radius=0.003)
 
+    # Check ICP convergence
+    print(f"\n=== ICP RESULTS ===")
+    # Handle both scalar and array error returns
+    error_val = float(icp_error) if np.isscalar(icp_error) else float(np.mean(icp_error))
+    print(f"Final ICP error: {error_val:.6f}")
+    if error_val > 0.01:
+        print("⚠️  WARNING: ICP error is high - registration may not have converged!")
+        print("   Consider: (1) adjusting initial guess, (2) increasing max_iterations,")
+        print("             (3) improving point cloud quality (more cameras, better crop)")
+    else:
+        print("✓ ICP converged successfully")
+    print(f"Estimated brick pose: xyz={X_brick_est.translation()}")
+    print(f"                      rpy={RollPitchYaw(X_brick_est.rotation()).vector()}")
+
     # CONTROL: rebuild a final diagram including station + DIK controller + sources (matching the notebook).
+    print("\n=== CONTROL PHASE ===")
     builder2 = DiagramBuilder()
     station2 = MakeHardwareStation(scenario, meshcat)
     builder2.AddSystem(station2)
     plant = station2.plant()
-    # Waypoints and trajectories
-    hover_h = 0.18
+
+    # Waypoints and trajectories (matching notebook pattern)
+    # TUNABLE PARAMETERS:
+    grasp_clearance = 0.08  # Distance from brick surface to gripper base (tune for better grasp)
+
     plant_ctx_tmp = plant.GetMyContextFromRoot(station2.CreateDefaultContext())
     X_WGinitial = plant.EvalBodyPoseInWorld(
         plant_ctx_tmp, plant.GetBodyByName("body", plant.GetModelInstanceByName("wsg"))
     )
-    X_OG = antipodal_grasp_for_box(brick_size, clearance_m=0.10)
-    X_grasp = X_brick_est @ X_OG
-    X_hover = RigidTransform(X_grasp.rotation(), X_grasp.translation() + np.array([0.0, 0.0, hover_h]))
+    print(f"Initial gripper pose: xyz={X_WGinitial.translation()}")
+
+    # Design grasp pose (returns both X_OG and X_WGpick)
+    X_OG, X_WGpick = design_grasp_for_brick(X_brick_est, brick_size, clearance_m=grasp_clearance)
+    print(f"Grasp offset from brick center: {X_OG.translation()}")
+
+    # Pre-grasp: approach from behind
+    X_WGprepick = design_pregrasp_pose(X_WGpick)
+
+    # Goal: move brick to a different location (away from robot base!)
     offsets_xy = [
-        np.array([0.20, 0.00, 0.0]),
-        np.array([0.00, 0.20, 0.0]),
-        np.array([-0.20, 0.00, 0.0]),
-        np.array([0.00, -0.20, 0.0]),
+        np.array([-0.25, 0.00, 0.0]),  # Forward (away from robot)
+        np.array([-0.15, 0.25, 0.0]),  # Forward-right
+        np.array([-0.15, -0.25, 0.0]), # Forward-left
+        np.array([-0.35, 0.00, 0.0]),  # Further forward
     ]
     goal_offset = offsets_xy[np.random.randint(len(offsets_xy))]
-    X_goal_obj = RigidTransform(X_brick_est.rotation(), X_brick_est.translation() + goal_offset)
-    X_WGgoal = X_goal_obj @ X_OG
-    X_WGgoal_hover = RigidTransform(X_WGgoal.rotation(), X_WGgoal.translation() + np.array([0.0, 0.0, hover_h]))
-    X_Gs = [X_WGinitial, X_hover, X_grasp, X_grasp, X_hover, X_WGgoal_hover, X_WGgoal, X_WGgoal_hover]
-    ts = [0, 1.5, 3.0, 4.0, 5.5, 8.0, 9.5, 11.0]
+    X_WOgoal = RigidTransform(X_brick_est.rotation(), X_brick_est.translation() + goal_offset)
+    X_WGgoal = X_WOgoal @ X_OG
+    print(f"Goal brick position: {X_WOgoal.translation()}")
+    print(f"Goal offset from current: {goal_offset[:2]}")
+
+    # Pre-goal and post-goal: hover positions
+    X_WGpregoal = design_pregoal_pose(X_WGgoal)
+    X_WGpostgoal = design_postgoal_pose(X_WGgoal)
+
+    # Build waypoint list matching notebook pattern:
+    # initial -> prepick -> pick -> (close) -> pregoal -> goal -> (open) -> postgoal -> initial
+    X_Gs = [
+        X_WGinitial,    # 0: Start position
+        X_WGprepick,    # 1: Approach brick
+        X_WGpick,       # 2: At brick (gripper open)
+        X_WGpick,       # 3: At brick (close gripper)
+        X_WGpregoal,    # 4: Lift up with brick
+        X_WGgoal,       # 5: At goal position
+        X_WGgoal,       # 6: At goal (open gripper)
+        X_WGpostgoal,   # 7: Lift after releasing
+        X_WGinitial     # 8: Return to start
+    ]
+    ts = [0, 2.0, 3.5, 4.5, 6.5, 9.0, 10.0, 11.0, 13.0]
     opened = 0.107
     closed = 0.0
-    fingers = np.asarray([opened, opened, closed, closed, closed, closed, opened, opened]).reshape(1, -1)
+    fingers = np.asarray([opened, opened, opened, closed, closed, closed, opened, opened, opened]).reshape(1, -1)
     traj_V_G, traj_wsg = make_trajectories(X_Gs, fingers, ts)
     # Wire controller and sources
     V_src = builder2.AddSystem(TrajectorySource(traj_V_G))
@@ -432,8 +538,24 @@ model_drivers:
     diagram2 = builder2.Build()
     sim2 = Simulator(diagram2)
     ctx2 = sim2.get_mutable_context()
+    
     q0 = plant.GetPositions(plant.GetMyContextFromRoot(ctx2), plant.GetModelInstanceByName("iiwa"))
     integ.GetMyContextFromRoot(ctx2).get_mutable_continuous_state_vector().SetFromVector(q0)
+
+    # Visualize trajectory waypoints in Meshcat
+    for i, X_G in enumerate(X_Gs):
+        AddMeshcatTriad(meshcat, f"trajectory/waypoint_{i}", X_PT=X_G, length=0.08, radius=0.002, opacity=0.6)
+
+    print(f"\nStarting pick-and-place simulation (duration: {ts[-1] + 0.5:.1f}s)...")
+    print(f"Trajectory: {len(X_Gs)} waypoints over {len(ts)} time steps")
+
     sim2.set_target_realtime_rate(1.0)
     sim2.Initialize()
     sim2.AdvanceTo(ts[-1] + 0.5)
+
+    print("\n=== SIMULATION COMPLETE ===")
+    print("✓ Check MeshCat visualization to see the result")
+    print("  - Red points: scene point cloud from cameras")
+    print("  - Green points: model cloud at initial ICP guess")
+    print("  - Blue points: model cloud after ICP alignment")
+    print("  - Trajectory waypoints: small coordinate frames along path")

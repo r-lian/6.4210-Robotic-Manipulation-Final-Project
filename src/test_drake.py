@@ -10,3 +10,4 @@ if __name__ == "__main__":
     print("Starting MeshCat… (check the VS Code Ports panel)")
     meshcat = StartMeshcat()
     time.sleep(30)
+    
