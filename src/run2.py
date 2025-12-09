@@ -193,7 +193,6 @@ if __name__ == "__main__":
         print("Failed!")
         return None
 
-    # Minimal differential-IK segment runner for small incremental motions
     def diffik(
         poses: list[RigidTransform],
         times: list[float],
@@ -204,6 +203,9 @@ if __name__ == "__main__":
     ) -> None:
         traj_pos = PiecewisePose.MakeLinear(times, poses)
         traj_VG = traj_pos.MakeDerivative()
+        for k, tk in enumerate(times):
+            print(traj_pos.GetPose(tk))
+            print(traj_VG.value(tk))    
 
         # ---- DEBUG triads (unchanged) ----
         seg_id = int(time.time() * 1000)
@@ -222,58 +224,61 @@ if __name__ == "__main__":
         ctx = simulator.get_mutable_context()
         plant = station.plant()
         plant_ctx = plant.GetMyContextFromRoot(ctx)
-
         iiwa_model = plant.GetModelInstanceByName(iiwa_name)
-        wsg_model = plant.GetModelInstanceByName(wsg_name)
 
-        G_frame = plant.GetBodyByName("body", wsg_model).body_frame()
-
-        # ---- Try controller port (already wired at build time) ----
-        use_controller_port = False
-        try:
-            if "left" in iiwa_name:
-                V_G_port = diagram.GetInputPort("V_G_left_cmd")
-                wsg_port_cmd = diagram.GetInputPort("wsg_left.position_cmd")
-            else:
-                V_G_port = diagram.GetInputPort("V_G_right_cmd")
-                wsg_port_cmd = diagram.GetInputPort("wsg_right.position_cmd")
-            use_controller_port = True
-        except Exception:
-            pass
-
-        # ---- Seed initial configuration from *current sim state* ----
+        # Seed q0 from current sim state if not provided
         if q0 is None:
             q0 = plant.GetPositions(plant_ctx, iiwa_model)
+        else:
+            q0 = np.asarray(q0, dtype=float)
 
-        # Keep plant + controller state consistent
+        # Keep plant pose consistent before starting the trajectory
         plant.SetPositions(plant_ctx, iiwa_model, q0)
 
-        # Publish once so visuals don't snap
+        # ---- Get controller + gripper command ports that were exported at build time ----
+        if "left" in iiwa_name:
+            V_G_port = diagram.GetInputPort("V_G_left_cmd")
+            diagram.GetInputPort("iiwa_left.source_select").FixValue(ctx, [1])
+            # wsg_port_cmd = diagram.GetInputPort("wsg_left.position_cmd")
+        else:
+            V_G_port = diagram.GetInputPort("V_G_right_cmd")
+            diagram.GetInputPort("iiwa_right.source_select").FixValue(ctx, [1])
+            # wsg_port_cmd = diagram.GetInputPort("wsg_right.position_cmd")
+
+        # Optional finger trajectory: interpolate scalar values over the same times
+        finger_values_arr = None
+        if finger_values is not None:
+            finger_values_arr = np.asarray(finger_values, dtype=float)
+            assert finger_values_arr.shape[1] == len(times), \
+                "finger_values must have same length as times"
+
+        # Publish once so visuals don't snap when we start moving
         diagram.ForcedPublish(ctx)
 
-        # # If you have an integrator driving q directly, seed it
-        # try:
-        #     integ.GetMyContextFromRoot(ctx)\
-        #         .get_mutable_continuous_state_vector()\
-        #         .SetFromVector(q0)
-        # except Exception:
-        #     pass
-
-        # ---- Run diff IK loop over time (absolute, monotonic target times) ----
+        # ---- Run diff IK loop: send V_WG(t), step the sim ----
         simulator.set_target_realtime_rate(1.0)
         print("diff ik starting...")
         base_time = ctx.get_time()
-        for tk in np.asarray(times, dtype=float):
+
+        counter = 0
+        for tk in times:
+            tk = float(tk)
             target_time = base_time + (tk - t0)
-            if use_controller_port:
-                diagram.GetInputPort("V_G_cmd").FixValue(
-                    ctx, traj_VG.value(tk).ravel()
-                )
-            else:
-                # fallback: manual Jacobian → dq stepping (unchanged logic goes here)
-                pass
+
+            # Spatial velocity command from trajectory
+            V_WG = traj_VG.value(tk).ravel()   # shape (6,)
+            print(V_WG)
+            V_G_port.FixValue(ctx, V_WG)
+
+            # Optional gripper command
+            if finger_values_arr is not None:
+                finger_cmd = float(np.interp(tk, times, finger_values_arr))
+                # wsg_port_cmd.FixValue(ctx, [finger_cmd])
 
             simulator.AdvanceTo(target_time)
+            counter += 1
+            if counter > 3:
+                break
 
         print(f"diff ik: {tf}\n")
 
@@ -296,28 +301,13 @@ if __name__ == "__main__":
         t0 = ctx.get_time()
         tf = t0 + float(duration_s)
         q_traj = PiecewisePolynomial.CubicShapePreserving([t0, tf], np.column_stack([q_now, q_target]), True)
-        iiwa_port = station.GetInputPort(f"{iiwa_name}.position")
-        # Use exported gripper command port (adder input), not the station port directly
-        try:
-            if "left" in wsg_name:
-                wsg_cmd_port = diagram.GetInputPort("wsg_left.position_cmd")
-            else:
-                wsg_cmd_port = diagram.GetInputPort("wsg_right.position_cmd")
-        except Exception:
-            wsg_cmd_port = None
-        dt = 0.02
-        t = t0
-        # Ensure gripper command port has an initial value before first AdvanceTo
-        if wsg_cmd_port is not None:
-            wsg_cmd_port.FixValue(ctx, np.array([opened]))
-        while t <= tf + 1e-9:
-            q = np.asarray(q_traj.value(t)).reshape(-1)
-            iiwa_port.FixValue(station.GetMyContextFromRoot(ctx), q)
-            if wsg_cmd_port is not None:
-                wsg_cmd_port.FixValue(ctx, np.array([opened]))
-            simulator.AdvanceTo(min(t, tf))
-            t += dt
-            
+        source = iiwa_left_trajectory_source if iiwa_name == "iiwa_left" else iiwa_right_trajectory_source
+        source.UpdateTrajectory(q_traj)
+        diagram.GetInputPort(f"{iiwa_name}.source_select").FixValue(ctx, [0])
+
+        simulator.AdvanceTo(tf)
+
+
     # --------- Analytic antipodal grasp for a box in its own frame (O) ----------
     def compute_antipodal_grasp_box_O(
         size_oxo: list[float] | np.ndarray,
@@ -381,11 +371,13 @@ if __name__ == "__main__":
         # 1) IK: initial -> prepick hover
         q_pre_pick = solve_ik(X_hover, iiwa_name=iiwa_name, wsg_name=wsg_name)
         joint_poly_interp_to_q(q_pre_pick, iiwa_name, wsg_name, duration_s=1.5, opened=opened)
-        # # 2) DIK: prepick -> grasp -> postpick
-        # poses_pick = [X_hover, X_grasp, X_grasp, X_hover]
-        # times_pick = [0.0, 1.5, 3.0, 4.0]
-        # fingers_pick = np.asarray([opened, opened, closed, closed]).reshape(1, -1)
-        # diffik(poses_pick, times_pick, iiwa_name, wsg_name, fingers_pick, q0=q_pre_pick if q_pre_pick is not None else None)
+
+        # 2) DIK: prepick -> grasp -> postpick
+        poses_pick = [X_hover, X_grasp, X_grasp, X_hover]
+        times_pick = [0.0, 1.5, 3.0, 4.0]
+        fingers_pick = np.asarray([opened, opened, closed, closed]).reshape(1, -1)
+        diffik(poses_pick, times_pick, iiwa_name, wsg_name, None, q0=q_pre_pick if q_pre_pick is not None else None)
+        
         # # 3) IK: postpick -> preplace hover
         # q_pre_place = solve_ik(X_WGgoal_hover, iiwa_name=iiwa_name, wsg_name=wsg_name)
         # # Polynomial interpolate joints to the preplace hover
@@ -818,41 +810,131 @@ model_drivers:
     except Exception as e:
         print(f"Warning: AddPointClouds failed; cameras may be missing from scenario: {e}")
     
-    # Pre-wire DIK controllers with additive posture hold (measured + delta_q)
-    # Left arm
-    controller_left = builder.AddSystem(PseudoInverseController(plant=station.plant(), iiwa_model_name="iiwa_left", wsg_model_name="wsg_left"))
+    # Seed iiwa position inputs to current measured posture (simplest "hold" until we command)
+    plant = station.plant()
+
+    # Use a default context to read the nominal starting posture
+    plant_ctx0 = plant.CreateDefaultContext()
+    iiwaL = plant.GetModelInstanceByName("iiwa_left")
+    iiwaR = plant.GetModelInstanceByName("iiwa_right")
+
+    qL0 = plant.GetPositions(plant_ctx0, iiwaL)
+    qR0 = plant.GetPositions(plant_ctx0, iiwaR)
+
+    # Make constant trajectories that just hold that posture
+    # (zero-order hold from t=0 to t=0 with identical endpoints)
+    qL_traj0 = PiecewisePolynomial.ZeroOrderHold(
+        [0.0, 1.0], np.column_stack([qL0, qL0])
+    )
+    qR_traj0 = PiecewisePolynomial.ZeroOrderHold(
+        [0.0, 1.0], np.column_stack([qR0, qR0])
+    )
+
+    iiwa_left_trajectory_source = builder.AddSystem(
+        TrajectorySource(qL_traj0)
+    )
+    iiwa_right_trajectory_source = builder.AddSystem(
+        TrajectorySource(qR_traj0)
+    )
+
+    # ----- VectorSwitch to choose between TrajectorySource (u0) and DIK (u1) -----
+    from pydrake.systems.framework import LeafSystem, BasicVector
+    class VectorSwitch(LeafSystem):
+        """
+        Outputs one of two vector inputs based on an integer mode.
+        mode = 0 → output u0
+        mode = 1 → output u1
+        """
+        def __init__(self, size: int):
+            super().__init__()
+            self.DeclareVectorInputPort("u0", BasicVector(size))
+            self.DeclareVectorInputPort("u1", BasicVector(size))
+            self._mode = self.DeclareVectorInputPort("mode", BasicVector(1))
+            self.DeclareVectorOutputPort("y", BasicVector(size), self.CalcOutput)
+        def CalcOutput(self, context, output):
+            mode_val = int(round(self._mode.Eval(context)[0]))  # 0 or 1
+            if mode_val == 0:
+                output.SetFromVector(self.get_input_port(0).Eval(context))
+            else:
+                # print("using DIK HAHAHAHAHA")
+                output.SetFromVector(self.get_input_port(1).Eval(context))
+
+    # Left switch: u0 = traj source, u1 = DIK adder
+
+    controller_left = builder.AddSystem(
+        PseudoInverseController(
+            plant=plant,
+            iiwa_model_name="iiwa_left",
+            wsg_model_name="wsg_left",
+        )
+    )
+
+    builder.ExportInput(
+        controller_left.get_input_port(0),   # "V_WG" in controller
+        "V_G_left_cmd",
+    )
+
+    builder.Connect(station.GetOutputPort("iiwa_left.position_measured"),
+                    controller_left.get_input_port(1))
     integrator_left = builder.AddSystem(Integrator(7))
-    adder_left = builder.AddSystem(Adder(2, 7))
-    # measured -> controller q input and to adder input 0
-    builder.Connect(station.GetOutputPort("iiwa_left.position_measured"), controller_left.get_input_port(1))
-    builder.Connect(station.GetOutputPort("iiwa_left.position_measured"), adder_left.get_input_port(0))
-    # controller -> integrator -> adder input 1 -> position command
-    builder.Connect(controller_left.get_output_port(), integrator_left.get_input_port())
-    builder.Connect(integrator_left.get_output_port(), adder_left.get_input_port(1))
-    builder.Connect(adder_left.get_output_port(), station.GetInputPort("iiwa_left.position"))
-    # export V_G and wsg position commands
-    builder.ExportInput(controller_left.get_input_port(0), "V_G_left_cmd")
-    # Gripper left: default open + command override
-    adder_wsg_left = builder.AddSystem(Adder(2, 1))
-    builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([0.107]))).get_output_port(),
-                    adder_wsg_left.get_input_port(0))
-    builder.Connect(adder_wsg_left.get_output_port(), station.GetInputPort("wsg_left.position"))
-    builder.ExportInput(adder_wsg_left.get_input_port(1), "wsg_left.position_cmd")
-    # Right arm
-    controller_right = builder.AddSystem(PseudoInverseController(plant=station.plant(), iiwa_model_name="iiwa_right", wsg_model_name="wsg_right"))
+
+    iiwa_left_switch = builder.AddSystem(VectorSwitch(7))
+    builder.Connect(iiwa_left_trajectory_source.get_output_port(),
+                    iiwa_left_switch.get_input_port(0))
+
+    builder.Connect(controller_left.get_output_port(),
+                    integrator_left.get_input_port())
+    builder.Connect(integrator_left.get_output_port(),
+                    iiwa_left_switch.get_input_port(1))
+    builder.Connect(iiwa_left_switch.get_output_port(),
+                    station.GetInputPort("iiwa_left.position"))
+
+    builder.ExportInput(iiwa_left_switch.get_input_port(2), "iiwa_left.source_select")
+
+
+    # Right switch: u0 = traj source, u1 = DIK adder
+    
+    controller_right = builder.AddSystem(
+        PseudoInverseController(
+            plant=plant,
+            iiwa_model_name="iiwa_right",
+            wsg_model_name="wsg_right",
+        )
+    )
+
+    builder.ExportInput(
+        controller_right.get_input_port(0),   # "V_WG" in controller
+        "V_G_right_cmd",
+    )
+
+    builder.Connect(station.GetOutputPort("iiwa_right.position_measured"),
+                    controller_right.get_input_port(1))
     integrator_right = builder.AddSystem(Integrator(7))
-    adder_right = builder.AddSystem(Adder(2, 7))
-    builder.Connect(station.GetOutputPort("iiwa_right.position_measured"), controller_right.get_input_port(1))
-    builder.Connect(station.GetOutputPort("iiwa_right.position_measured"), adder_right.get_input_port(0))
-    builder.Connect(controller_right.get_output_port(), integrator_right.get_input_port())
-    builder.Connect(integrator_right.get_output_port(), adder_right.get_input_port(1))
-    builder.Connect(adder_right.get_output_port(), station.GetInputPort("iiwa_right.position"))
-    builder.ExportInput(controller_right.get_input_port(0), "V_G_right_cmd")
-    adder_wsg_right = builder.AddSystem(Adder(2, 1))
-    builder.Connect(builder.AddSystem(ConstantVectorSource(np.array([0.107]))).get_output_port(),
-                    adder_wsg_right.get_input_port(0))
-    builder.Connect(adder_wsg_right.get_output_port(), station.GetInputPort("wsg_right.position"))
-    builder.ExportInput(adder_wsg_right.get_input_port(1), "wsg_right.position_cmd")
+
+    iiwa_right_switch = builder.AddSystem(VectorSwitch(7))
+    builder.Connect(iiwa_right_trajectory_source.get_output_port(),
+                    iiwa_right_switch.get_input_port(0))
+
+    builder.Connect(controller_right.get_output_port(),
+                    integrator_right.get_input_port())
+    builder.Connect(integrator_right.get_output_port(),
+                    iiwa_right_switch.get_input_port(1))
+    builder.Connect(iiwa_right_switch.get_output_port(),
+                    station.GetInputPort("iiwa_right.position"))
+
+    builder.ExportInput(iiwa_right_switch.get_input_port(2), "iiwa_right.source_select")
+
+
+    # WSG position hold
+
+    builder.Connect(
+        builder.AddSystem(ConstantVectorSource(np.array([0.107]))).get_output_port(),
+        station.GetInputPort("wsg_left.position"),
+    )
+    builder.Connect(
+        builder.AddSystem(ConstantVectorSource(np.array([0.107]))).get_output_port(),
+        station.GetInputPort("wsg_right.position"),
+    )
 
     diagram = builder.Build()
 
@@ -862,6 +944,12 @@ model_drivers:
 
     simulator = Simulator(diagram)
     simulator.set_target_realtime_rate(10)
+    # Seed switch modes to use trajectory sources (0) by default.
+    ctx0 = simulator.get_mutable_context()
+    diagram.GetInputPort("iiwa_left.source_select").FixValue(ctx0, 0)
+    diagram.GetInputPort("iiwa_right.source_select").FixValue(ctx0, 0)
+    diagram.GetInputPort("V_G_left_cmd").FixValue(ctx0, np.zeros(6))
+    diagram.GetInputPort("V_G_right_cmd").FixValue(ctx0, np.zeros(6))
     simulator.Initialize()
 
     # ---------------- ICP -> antipodal grasp -> IK place ----------------
