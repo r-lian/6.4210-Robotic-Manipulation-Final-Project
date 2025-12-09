@@ -147,7 +147,9 @@ directives:
         base_frame: camera2::base
 
 model_drivers:
-    iiwa: !IiwaDriver {{}}
+    iiwa: !IiwaDriver
+        control_mode: position_only
+        hand_model_name: wsg
     wsg: !SchunkWsgDriver {{}}
 cameras:
     camera0:
@@ -349,9 +351,9 @@ if __name__ == "__main__":
     wsg_src = builder2.AddSystem(TrajectorySource(traj_wsg))
 
     builder2.Connect(V_src.get_output_port(), controller.get_input_port(0))
-    builder2.Connect(station2.GetOutputPort("iiwa.position_measured"), controller.get_input_port(1))
     builder2.Connect(controller.get_output_port(), integrator.get_input_port())
     builder2.Connect(integrator.get_output_port(), station2.GetInputPort("iiwa.position"))
+    builder2.Connect(station2.GetOutputPort("iiwa.position_measured"), controller.get_input_port(1))
     builder2.Connect(wsg_src.get_output_port(), station2.GetInputPort("wsg.position"))
 
     try:
