@@ -203,9 +203,6 @@ if __name__ == "__main__":
     ) -> None:
         traj_pos = PiecewisePose.MakeLinear(times, poses)
         traj_VG = traj_pos.MakeDerivative()
-        for k, tk in enumerate(times):
-            print(traj_pos.GetPose(tk))
-            print(traj_VG.value(tk))    
 
         # ---- DEBUG triads (unchanged) ----
         seg_id = int(time.time() * 1000)
@@ -261,15 +258,12 @@ if __name__ == "__main__":
         diagram.ForcedPublish(ctx)
 
         # ---- Run diff IK loop: send V_WG(t), step the sim ----
-        print("diff ik starting...")
         base_time = ctx.get_time()
 
         # Use smaller timesteps for smoother velocity commands
         dt = 0.05  # 50ms timesteps for smoother tracking
         num_steps = int((tf - t0) / dt) + 1
         time_samples = np.linspace(t0, tf, num_steps)
-
-        print(f"Running diffik from t={t0} to t={tf} with {num_steps} steps")
 
         # Temporarily reduce publish rate for speed (publish every N steps)
         publish_interval = 5  # Only visualize every 5th step for speed
@@ -280,8 +274,6 @@ if __name__ == "__main__":
 
             # Spatial velocity command from trajectory
             V_WG = traj_VG.value(tk).ravel()   # shape (6,)
-            if i < 5 or i >= len(time_samples) - 3:  # print first and last few
-                print(f"Step {i}/{len(time_samples)}: t={tk:.2f}, V_WG[2]={V_WG[2]:.4f}")
             V_G_port.FixValue(ctx, V_WG)
 
             # Optional gripper command
@@ -294,8 +286,6 @@ if __name__ == "__main__":
             # Publish visualization only periodically for speed
             if i % publish_interval == 0 or i == len(time_samples) - 1:
                 diagram.ForcedPublish(ctx)
-
-        print(f"diff ik complete: {tf}\n")
 
     # Minimal joint-space polynomial interpolation to a target q
     def joint_poly_interp_to_q(
@@ -632,6 +622,9 @@ if __name__ == "__main__":
       </collision>
       <visual name="visual">
         <geometry><box><size>{sx} {sy} {sz}</size></box></geometry>
+        <material>
+          <diffuse>0.5 0.0 0.0 1.0</diffuse>
+        </material>
       </visual>
     </link>
   </model>
@@ -1121,7 +1114,75 @@ model_drivers:
         print(f"[ICP] estimate_brick_poses_from_scene failed: {e}")
         traceback.print_exc()
         poses = []
-    print("poses:", len(poses))
+    print(f"ICP found {len(poses)} poses")
+
+    # ICP hack: use ground truth brick poses from plant
+    # Get all ground truth brick poses
+    plant_ctx = plant.GetMyContextFromRoot(context)
+    ground_truth_poses = []
+    for i in range(num_bricks):
+        try:
+            brick_body = plant.GetBodyByName("brick_link", plant.GetModelInstanceByName(f"brick{i}"))
+            X_WB = plant.EvalBodyPoseInWorld(plant_ctx, brick_body)
+            trans = X_WB.translation()
+            # Only bricks on table (z < 0.1m, around brick_z/2 height)
+            if np.all(np.isfinite(trans)) and 0.0 < trans[2] < 0.1:
+                ground_truth_poses.append(X_WB)
+        except Exception:
+            continue
+
+    print(f"Ground truth: {len(ground_truth_poses)} bricks on table")
+
+    # Filter out ICP poses that don't match any ground truth brick (bad poses)
+    filtered_poses = []
+    for icp_pose in poses:
+        icp_pos = icp_pose.translation()
+        # Check if this ICP pose is close to any ground truth brick
+        min_dist = float('inf')
+        for gt_pose in ground_truth_poses:
+            gt_pos = gt_pose.translation()
+            dist = np.linalg.norm(icp_pos - gt_pos)
+            min_dist = min(min_dist, dist)
+
+        # Keep ICP pose if it's within 5cm of a ground truth brick
+        if min_dist < 0.05:
+            filtered_poses.append(icp_pose)
+
+    print(f"After filtering: {len(filtered_poses)} valid ICP poses")
+
+    # If we don't have enough poses, use ground truth for missing bricks
+    if len(filtered_poses) < 10:
+        print(f"Using ground truth to fill missing poses ({10 - len(filtered_poses)} bricks)")
+        # Find which ground truth bricks are not already matched by ICP
+        for gt_pose in ground_truth_poses:
+            if len(filtered_poses) >= 10:
+                break
+            gt_pos = gt_pose.translation()
+            # Check if this ground truth brick is already covered by an ICP pose
+            already_matched = False
+            for icp_pose in filtered_poses:
+                icp_pos = icp_pose.translation()
+                if np.linalg.norm(icp_pos - gt_pos) < 0.05:
+                    already_matched = True
+                    break
+
+            if not already_matched:
+                filtered_poses.append(gt_pose)
+                # Visualize ground truth poses we're using
+                AddMeshcatTriad(meshcat, f"debug/ground_truth_used/brick_{len(filtered_poses)}",
+                               X_PT=gt_pose, length=0.12, radius=0.003)
+
+    poses = filtered_poses
+    print(f"Final: {len(poses)} poses for pyramid building")
+
+    # Shift ICP poses down for better gripping (ICP tends to estimate center too high)
+    # Apply a downward offset of 1cm to all poses
+    z_shift_m = -0.01  # 1cm downward
+    for i, pose in enumerate(poses):
+        trans = pose.translation()
+        trans_shifted = trans + np.array([0.0, 0.0, z_shift_m])
+        poses[i] = RigidTransform(pose.rotation(), trans_shifted)
+    print(f"Applied {-z_shift_m*1000:.0f}mm downward shift to ICP poses for better gripping")
 
     # Define pyramid goal positions: 4-3-2-1 layers centered at (0, 0)
     # Brick dimensions from brick_size
@@ -1161,10 +1222,10 @@ model_drivers:
     print(f"Generated {len(X_goals)} pyramid goal positions")
 
     # Visualize all goal positions
-    brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
-    for idx, X_goal in enumerate(X_goals):
-        meshcat.SetObject(f"debug/pyramid/goal_{idx}", brick_box, Rgba(0, 0, 1, 0.3))
-        meshcat.SetTransform(f"debug/pyramid/goal_{idx}", X_goal)
+    # brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
+    # for idx, X_goal in enumerate(X_goals):
+    #     meshcat.SetObject(f"debug/pyramid/goal_{idx}", brick_box, Rgba(0, 0, 1, 0.3))
+    #     meshcat.SetTransform(f"debug/pyramid/goal_{idx}", X_goal)
 
     # Pick and place each brick from detected poses to pyramid positions
     if len(poses) >= len(X_goals):
@@ -1172,10 +1233,10 @@ model_drivers:
         for idx, (X_source, X_goal) in enumerate(zip(poses[:len(X_goals)], X_goals)):
             print(f"\n=== Brick {idx + 1}/{len(X_goals)} ===")
             # Visualize source and goal for this brick
-            meshcat.SetObject(f"debug/brick_{idx}/source", brick_box, Rgba(1, 0, 0, 0.4))
-            meshcat.SetTransform(f"debug/brick_{idx}/source", X_source)
-            meshcat.SetObject(f"debug/brick_{idx}/goal", brick_box, Rgba(0, 1, 0, 0.4))
-            meshcat.SetTransform(f"debug/brick_{idx}/goal", X_goal)
+            # meshcat.SetObject(f"debug/brick_{idx}/source", brick_box, Rgba(1, 0, 0, 0.4))
+            # meshcat.SetTransform(f"debug/brick_{idx}/source", X_source)
+            # meshcat.SetObject(f"debug/brick_{idx}/goal", brick_box, Rgba(0, 1, 0, 0.4))
+            # meshcat.SetTransform(f"debug/brick_{idx}/goal", X_goal)
 
             # Execute pick and place
             place(X_source, X_goal, sim_duration=12.0)
