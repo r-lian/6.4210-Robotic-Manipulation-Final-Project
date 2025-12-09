@@ -67,17 +67,25 @@ def write_table_sdf(table_path: Path) -> None:
 def write_brick_sdf(brick_path: Path, size_xyz: list[float]) -> None:
     """Create brick SDF with high friction like the notebook's letters."""
     sx, sy, sz = size_xyz
+    mass = 0.1  # 100 grams
+
+    # Calculate physically accurate inertia for rectangular box
+    # For a box: I = (m/12) * (dimension1^2 + dimension2^2)
+    ixx = (mass / 12.0) * (sy**2 + sz**2)  # Rotation about X axis
+    iyy = (mass / 12.0) * (sx**2 + sz**2)  # Rotation about Y axis
+    izz = (mass / 12.0) * (sx**2 + sy**2)  # Rotation about Z axis
+
     brick_path.write_text(
         f"""<?xml version="1.0"?>
 <sdf version="1.7">
     <model name="brick">
         <link name="brick_link">
             <inertial>
-                <mass>0.1</mass>
+                <mass>{mass}</mass>
                 <inertia>
-                    <ixx>0.001</ixx><ixy>0</ixy><ixz>0</ixz>
-                    <iyy>0.001</iyy><iyz>0</iyz>
-                    <izz>0.001</izz>
+                    <ixx>{ixx:.9f}</ixx><ixy>0</ixy><ixz>0</ixz>
+                    <iyy>{iyy:.9f}</iyy><iyz>0</iyz>
+                    <izz>{izz:.9f}</izz>
                 </inertia>
             </inertial>
             <collision name="collision">

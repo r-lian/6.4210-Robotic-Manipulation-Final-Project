@@ -289,14 +289,14 @@ if __name__ == "__main__":
     # Brick positions (in front of each robot)
     # Left robot at [-0.5, -0.5], right robot at [0.5, -0.5]
     # Bricks should be forward (positive Y direction) from robot base
-    # Moving bricks further away: from 0.3m to 0.5m forward
+    # Optimal workspace: 0.4-0.65m from base (avoid too close and too far)
     np.random.seed(42)
-    brick1_pos = [-0.50, 0.00, np.random.uniform(0, np.pi)]  # Left arm's brick (0.5m forward)
-    brick2_pos = [0.50, 0.00, np.random.uniform(0, np.pi)]   # Right arm's brick (0.5m forward)
+    brick1_pos = [-0.50, -0.10, np.random.uniform(0, np.pi)]  # Left arm's brick (0.4m forward)
+    brick2_pos = [0.50, -0.10, np.random.uniform(0, np.pi)]   # Right arm's brick (0.4m forward)
 
-    # Goal positions (further forward from robot)
-    goal1_pos = [-0.50, 0.30]  # Left arm goal
-    goal2_pos = [0.50, 0.30]   # Right arm goal
+    # Goal positions (0.65m from base - good reach without full extension)
+    goal1_pos = [-0.50, 0.15]  # Left arm goal (0.65m from base)
+    goal2_pos = [0.50, 0.15]   # Right arm goal (0.65m from base)
 
     print(f"Left arm:")
     print(f"  Brick 1 initial: [{brick1_pos[0]:.2f}, {brick1_pos[1]:.2f}], rot={np.degrees(brick1_pos[2]):.1f}°")

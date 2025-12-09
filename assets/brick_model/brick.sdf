@@ -5,9 +5,9 @@
             <inertial>
                 <mass>0.1</mass>
                 <inertia>
-                    <ixx>0.001</ixx><ixy>0</ixy><ixz>0</ixz>
-                    <iyy>0.001</iyy><iyz>0</iyz>
-                    <izz>0.001</izz>
+                    <ixx>0.000066667</ixx><ixy>0</ixy><ixz>0</ixz>
+                    <iyy>0.000096667</iyy><iyz>0</iyz>
+                    <izz>0.000136667</izz>
                 </inertia>
             </inertial>
             <collision name="collision">
