@@ -166,7 +166,7 @@ if __name__ == "__main__":
             theta_bound=1 * np.pi / 180,
         )
 
-        ik.AddMinimumDistanceLowerBoundConstraint(0.01)
+        ik.AddMinimumDistanceLowerBoundConstraint(0.015)  # Increased from 1cm to 1.5cm clearance
 
         for count in range(max_tries):
             # TODO: Compute a random initial guess here, within the joint limits of the robot
@@ -1189,12 +1189,16 @@ model_drivers:
     brick_x, brick_y, brick_z = brick_size
     table_height = 0.0  # Table surface at z=0
 
+    # Small clearance to prevent collision accidents (2mm horizontal gap between bricks)
+    horizontal_gap = 0.002  # 2mm gap
+    brick_x_with_gap = brick_x + horizontal_gap
+
     X_goals = []
     z_offset = table_height + brick_z / 2  # First layer: half-height above table
 
     # Layer 1 (bottom): 4 bricks in a row along x-axis
     for i in range(4):
-        x = (i - 1.5) * brick_x  # Centers at -1.5, -0.5, 0.5, 1.5 brick widths
+        x = (i - 1.5) * brick_x_with_gap  # Centers at -1.5, -0.5, 0.5, 1.5 brick widths (with gap)
         y = 0.0
         z = z_offset
         X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
@@ -1202,7 +1206,7 @@ model_drivers:
     # Layer 2: 3 bricks, offset by half brick width
     z_offset += brick_z
     for i in range(3):
-        x = (i - 1.0) * brick_x  # Centers at -1.0, 0.0, 1.0 brick widths
+        x = (i - 1.0) * brick_x_with_gap  # Centers at -1.0, 0.0, 1.0 brick widths (with gap)
         y = 0.0
         z = z_offset
         X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
@@ -1210,7 +1214,7 @@ model_drivers:
     # Layer 3: 2 bricks
     z_offset += brick_z
     for i in range(2):
-        x = (i - 0.5) * brick_x  # Centers at -0.5, 0.5 brick widths
+        x = (i - 0.5) * brick_x_with_gap  # Centers at -0.5, 0.5 brick widths (with gap)
         y = 0.0
         z = z_offset
         X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
