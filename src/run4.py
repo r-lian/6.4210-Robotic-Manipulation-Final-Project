@@ -170,9 +170,9 @@ if __name__ == "__main__":
             theta_bound=1 * np.pi / 180,
         )
 
-        # Use smaller clearance for pyramid placement (bricks need to be close)
-        # Default is 1.5cm, but for pyramid we use 5mm to allow tighter stacking
-        ik.AddMinimumDistanceLowerBoundConstraint(0.005, 1e-6)  # 5mm clearance with relaxed tolerance
+        # Use smaller clearance for stacking (bricks need to be close)
+        # 3mm clearance allows tight stacking while preventing penetration
+        ik.AddMinimumDistanceLowerBoundConstraint(0.003, 1e-6)  # 3mm clearance
 
         for count in range(max_tries):
             # TODO: Compute a random initial guess here, within the joint limits of the robot
@@ -615,7 +615,9 @@ if __name__ == "__main__":
     arm_states = {"left": ArmState.IDLE, "right": ArmState.IDLE}
     arm_plans = {"left": None, "right": None}
 
-    # No synchronization needed - single-threaded interleaved execution
+    # Background planning threads
+    arm_planning_threads = {"left": None, "right": None}
+    arm_planning_locks = {"left": threading.Lock(), "right": threading.Lock()}
 
     def plan_arm_task(arm_name: str, task: ArmTask):
         """
@@ -896,47 +898,79 @@ if __name__ == "__main__":
         print(f"[{arm_name}] Set up phase schedule with {len(phase_schedule)} phases")
         return phase_schedule
 
+    def background_planning_worker(arm_name: str, task: ArmTask):
+        """
+        Background thread worker function for planning.
+        Runs RRT and IK planning WITHOUT blocking the simulator.
+        """
+        global arm_states, arm_plans, obstacle_reservations, arm_planning_locks
+
+        import time as time_module
+        queue = left_task_queue if arm_name == "left" else right_task_queue
+
+        try:
+            t_start_wall = time_module.time()
+            print(f"[{arm_name}] Background planning started for brick {task.brick_idx}")
+
+            # PLANNING phase: compute plan (no simulator advance)
+            plan = plan_arm_task(arm_name, task)
+
+            t_end_wall = time_module.time()
+            planning_duration_wall = t_end_wall - t_start_wall
+            print(f"[{arm_name}] Background planning took {planning_duration_wall:.3f}s (wall time)")
+
+            # Atomically update state with lock
+            with arm_planning_locks[arm_name]:
+                if plan is None:
+                    print(f"[{arm_name}] Planning failed, re-queuing task brick {task.brick_idx}")
+                    queue.put(task)
+                    arm_states[arm_name] = ArmState.IDLE
+                else:
+                    arm_plans[arm_name] = plan
+                    arm_states[arm_name] = ArmState.EXECUTING
+                    print(f"[{arm_name}] Background planning complete, ready to execute")
+
+        except Exception as e:
+            print(f"[{arm_name}] Background planning exception: {e}, re-queuing task brick {task.brick_idx}")
+            import traceback
+            traceback.print_exc()
+            with arm_planning_locks[arm_name]:
+                queue.put(task)
+                arm_states[arm_name] = ArmState.IDLE
+
     def process_arm_planning(arm_name: str):
         """
-        Process planning phase for an arm.
-        Returns True if planning work was done, False if idle or already executing
+        Process planning phase for an arm by launching background thread.
+        Returns True if planning work was started, False if idle or already executing
         """
-        global arm_states, arm_plans, obstacle_reservations
+        global arm_states, arm_plans, obstacle_reservations, arm_planning_threads, arm_planning_locks
 
         queue = left_task_queue if arm_name == "left" else right_task_queue
 
         # Only plan if IDLE
-        if arm_states[arm_name] == ArmState.IDLE:
-            try:
-                task = queue.get(block=False)
-                print(f"[{arm_name}] Got task: brick {task.brick_idx}")
-                arm_states[arm_name] = ArmState.PLANNING
-                print(f"[{arm_name}] Starting planning for brick {task.brick_idx}")
-
-                # PLANNING phase: compute plan (no simulator advance)
+        with arm_planning_locks[arm_name]:
+            if arm_states[arm_name] == ArmState.IDLE:
                 try:
-                    plan = plan_arm_task(arm_name, task)
+                    task = queue.get(block=False)
+                    ctx = simulator.get_mutable_context()
+                    t_start_planning = ctx.get_time()
+                    print(f"[{arm_name}] t={t_start_planning:.2f}s Got task: brick {task.brick_idx}, queue_remaining={queue.qsize()}")
+                    arm_states[arm_name] = ArmState.PLANNING
+                    print(f"[{arm_name}] Launching background planning thread for brick {task.brick_idx}")
 
-                    if plan is None:
-                        print(f"[{arm_name}] Planning failed, skipping task")
-                        arm_states[arm_name] = ArmState.IDLE
-                        return True  # Try next task
-
-                    arm_plans[arm_name] = plan
-                    arm_states[arm_name] = ArmState.EXECUTING
-                    print(f"[{arm_name}] Planning complete, ready to execute")
+                    # Launch background planning thread
+                    planning_thread = threading.Thread(
+                        target=background_planning_worker,
+                        args=(arm_name, task),
+                        daemon=True
+                    )
+                    planning_thread.start()
+                    arm_planning_threads[arm_name] = planning_thread
                     return True
 
-                except Exception as e:
-                    print(f"[{arm_name}] Planning exception: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    arm_states[arm_name] = ArmState.IDLE
-                    return True  # Try next task
-
-            except Empty:
-                # No tasks available
-                return False
+                except Empty:
+                    # No tasks available
+                    return False
 
         return False
 
@@ -1338,7 +1372,8 @@ if __name__ == "__main__":
       <collision name="collision">
         <geometry><box><size>{sx} {sy} {sz}</size></box></geometry>
         <drake:proximity_properties>
-          <drake:rigid_hydroelastic/>
+          <drake:compliant_hydroelastic/>
+          <drake:hydroelastic_modulus>1.0e8</drake:hydroelastic_modulus>
           <drake:mu_static>1.0</drake:mu_static>
           <drake:mu_dynamic>1.0</drake:mu_dynamic>
         </drake:proximity_properties>
@@ -1907,46 +1942,62 @@ model_drivers:
         poses[i] = RigidTransform(pose.rotation(), trans_shifted)
     print(f"Applied {-z_shift_m*1000:.0f}mm downward shift to ICP poses for better gripping")
 
-    # Define pyramid goal positions: 4-3-2-1 layers centered at (0, 0)
-    # Brick dimensions from brick_size
+    # Simple 1-stack scenario: stack all bricks vertically at (0, 0)
     brick_x, brick_y, brick_z = brick_size
     table_height = 0.0  # Table surface at z=0
 
-    # Small clearance to prevent collision accidents (2mm horizontal gap between bricks)
-    horizontal_gap = 0.002  # 2mm gap
-    brick_x_with_gap = brick_x + horizontal_gap
-
     X_goals = []
-    z_offset = table_height + brick_z / 2  # First layer: half-height above table
+    z_offset = table_height + brick_z / 2  # First brick: half-height above table
 
-    # Layer 1 (bottom): 4 bricks in a row along x-axis
-    for i in range(4):
-        x = (i - 1.5) * brick_x_with_gap  # Centers at -1.5, -0.5, 0.5, 1.5 brick widths (with gap)
-        y = 0.0
-        z = z_offset
-        X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
+    # Stack all 10 bricks vertically with gap to prevent sinking
+    vertical_gap = 0.005  # 5mm gap between bricks to prevent penetration (increased from 2mm)
+    for i in range(10):
+        X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([0.0, 0.0, z_offset])))
+        z_offset += brick_z + vertical_gap  # Next brick on top with gap
 
-    # Layer 2: 3 bricks, offset by half brick width
-    z_offset += brick_z
-    for i in range(3):
-        x = (i - 1.0) * brick_x_with_gap  # Centers at -1.0, 0.0, 1.0 brick widths (with gap)
-        y = 0.0
-        z = z_offset
-        X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
+    print(f"Generated {len(X_goals)} goal positions (vertical stack with {vertical_gap*1000:.0f}mm gaps)")
 
-    # Layer 3: 2 bricks
-    z_offset += brick_z
-    for i in range(2):
-        x = (i - 0.5) * brick_x_with_gap  # Centers at -0.5, 0.5 brick widths (with gap)
-        y = 0.0
-        z = z_offset
-        X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
-
-    # Layer 4 (top): 1 brick
-    z_offset += brick_z
-    X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([0.0, 0.0, z_offset])))
-
-    print(f"Generated {len(X_goals)} pyramid goal positions")
+    # # PYRAMID VERSION (COMMENTED OUT):
+    # # Define pyramid goal positions: 4-3-2-1 layers centered at (0, 0)
+    # # Brick dimensions from brick_size
+    # brick_x, brick_y, brick_z = brick_size
+    # table_height = 0.0  # Table surface at z=0
+    #
+    # # Small clearance to prevent collision accidents (2mm horizontal gap between bricks)
+    # horizontal_gap = 0.002  # 2mm gap
+    # brick_x_with_gap = brick_x + horizontal_gap
+    #
+    # X_goals = []
+    # z_offset = table_height + brick_z / 2  # First layer: half-height above table
+    #
+    # # Layer 1 (bottom): 4 bricks in a row along x-axis
+    # for i in range(4):
+    #     x = (i - 1.5) * brick_x_with_gap  # Centers at -1.5, -0.5, 0.5, 1.5 brick widths (with gap)
+    #     y = 0.0
+    #     z = z_offset
+    #     X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
+    #
+    # # Layer 2: 3 bricks, offset by half brick width
+    # z_offset += brick_z
+    # for i in range(3):
+    #     x = (i - 1.0) * brick_x_with_gap  # Centers at -1.0, 0.0, 1.0 brick widths (with gap)
+    #     y = 0.0
+    #     z = z_offset
+    #     X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
+    #
+    # # Layer 3: 2 bricks
+    # z_offset += brick_z
+    # for i in range(2):
+    #     x = (i - 0.5) * brick_x_with_gap  # Centers at -0.5, 0.5 brick widths (with gap)
+    #     y = 0.0
+    #     z = z_offset
+    #     X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([x, y, z])))
+    #
+    # # Layer 4 (top): 1 brick
+    # z_offset += brick_z
+    # X_goals.append(RigidTransform(RotationMatrix.Identity(), np.array([0.0, 0.0, z_offset])))
+    #
+    # print(f"Generated {len(X_goals)} pyramid goal positions")
 
     # Visualize all goal positions
     # brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
