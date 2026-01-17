@@ -22,8 +22,10 @@ if __name__ == "__main__":
     try:
         seed_val = (int(time.time_ns()) ^ int.from_bytes(os.urandom(8), "little")) & 0xFFFFFFFF
         np.random.seed(seed_val)
+        print(f"Random seed: {seed_val}")
     except Exception:
         np.random.seed(None)
+        print("Random seed: None (using system time)")
 
 
     # ---------- Minimal Diff-IK utilities (not wired by default) ----------
@@ -415,6 +417,21 @@ if __name__ == "__main__":
                     idx = tree[idx][1]
                 path.reverse()
                 print(f"RRT found path with {len(path)} waypoints in {iteration + 1} iterations for {iiwa_name}")
+
+                # Save the complete RRT tree for visualization
+                import pickle
+                tree_data = {
+                    'tree': tree,  # list of (q, parent_idx, time)
+                    'path': path,
+                    'iiwa_name': iiwa_name,
+                    'q_start': q_start,
+                    'q_goal': q_goal,
+                }
+                tree_file = f"rrt_tree_{iiwa_name}.pkl"
+                with open(tree_file, 'wb') as f:
+                    pickle.dump(tree_data, f)
+                print(f"Saved RRT tree with {len(tree)} nodes to {tree_file}")
+
                 return path
 
         print(f"RRT failed for {iiwa_name} after {max_iterations} iterations")
@@ -1191,6 +1208,39 @@ if __name__ == "__main__":
                     # Arm just transitioned to EXECUTING, initialize its phase schedule
                     start_arm_execution(arm_name)
 
+                    # ============ VISUALIZATION: RRT path triads ============
+                    # Visualize the RRT path by sampling it and showing gripper poses
+                    plan = arm_plans[arm_name]
+                    rrt_path = plan["rrt_path"]
+                    brick_idx = plan['task'].brick_idx
+
+                    # Use a separate plant context for visualization (don't touch simulator context!)
+                    plant = station.plant()
+                    viz_ctx = plant.CreateDefaultContext()
+                    iiwa_name = f"iiwa_{arm_name}"
+                    wsg_name = f"wsg_{arm_name}"
+                    iiwa_model = plant.GetModelInstanceByName(iiwa_name)
+                    wsg_model = plant.GetModelInstanceByName(wsg_name)
+                    G_body = plant.GetBodyByName("body", wsg_model)
+
+                    # Sample every 2nd waypoint to avoid clutter
+                    for i in range(0, len(rrt_path), 2):
+                        q = rrt_path[i]
+                        plant.SetPositions(viz_ctx, iiwa_model, q)
+                        X_WG = plant.EvalBodyPoseInWorld(viz_ctx, G_body)
+
+                        AddMeshcatTriad(
+                            meshcat,
+                            f"debug/rrt/{arm_name}/brick{brick_idx}/waypoint_{i}",
+                            X_PT=X_WG,
+                            length=0.06,
+                            radius=0.002,
+                            opacity=0.6
+                        )
+
+                    print(f"[{arm_name}] Drew {len(rrt_path)//2} RRT triads for brick {brick_idx}")
+                    # ============ END VISUALIZATION ============
+
             # PHASE 3: Update phase states for both arms
             # Both arms update their inputs independently based on current time
             update_arm_phase("left", current_time)
@@ -1323,6 +1373,33 @@ if __name__ == "__main__":
     - add_weld:
         parent: camera3_origin
         child: camera3::base
+
+    # Stack monitoring cameras - positioned at sides of brick stack at [0,0]
+    - add_frame:
+        name: stack_camera_left_origin
+        X_PF:
+            base_frame: world
+            rotation: !Rpy {{ deg: [0.0, -30.0, 90.0]}}
+            translation: [0.0, 0.25, 0.25]
+    - add_model:
+        name: stack_camera_left
+        file: package://manipulation/camera_box.sdf
+    - add_weld:
+        parent: stack_camera_left_origin
+        child: stack_camera_left::base
+
+    - add_frame:
+        name: stack_camera_right_origin
+        X_PF:
+            base_frame: world
+            rotation: !Rpy {{ deg: [0.0, -30.0, -90.0]}}
+            translation: [0.0, -0.25, 0.25]
+    - add_model:
+        name: stack_camera_right
+        file: package://manipulation/camera_box.sdf
+    - add_weld:
+        parent: stack_camera_right_origin
+        child: stack_camera_right::base
 
 """
 
@@ -1638,7 +1715,7 @@ model_drivers:
     # IMPORTANT: Pass meshcat=None to disable continuous point cloud visualization (huge speedup!)
     try:
         to_point_cloud = AddPointClouds(
-            scenario=scenario, station=station, builder=builder, meshcat=None
+            scenario=scenario, station=station, builder=builder, meshcat=meshcat
         )
         builder.ExportOutput(to_point_cloud["camera0"].get_output_port(), "camera_point_cloud0")
         builder.ExportOutput(to_point_cloud["camera1"].get_output_port(), "camera_point_cloud1")
@@ -1809,9 +1886,12 @@ model_drivers:
     cropped = PointCloud(int(np.sum(keep)))
     cropped.mutable_xyzs()[:] = merged.xyzs()[:, keep]
 
-    # Optional: visualize merged/cropped scene cloud (only once for debugging)
-    # Uncomment next line if you want to see the point cloud in meshcat:
-    # meshcat.SetObject("debug/icp/scene_cropped", cropped, point_size=0.01, rgba=Rgba(0, 1, 0, 0.3))
+    # Visualize and save the point cloud
+    meshcat.SetObject("point_cloud", cropped, point_size=0.003, rgba=Rgba(0.8, 0.8, 0.8, 0.5))
+
+    # Save point cloud to file for later visualization
+    np.save("point_cloud.npy", cropped.xyzs().T)
+    print(f"Saved point cloud to point_cloud.npy")
 
     # Downsample for faster ICP
     scene_cloud = cropped.VoxelizedDownSample(0.01)
@@ -1934,8 +2014,8 @@ model_drivers:
     print(f"Final: {len(poses)} poses for pyramid building")
 
     # Shift ICP poses down for better gripping (ICP tends to estimate center too high)
-    # Apply a downward offset of 1cm to all poses
-    z_shift_m = -0.01  # 1cm downward
+    # Apply a downward offset of 1.5cm to all poses for more secure grip
+    z_shift_m = -0.03  # 3cm downward (increased from 1cm)
     for i, pose in enumerate(poses):
         trans = pose.translation()
         trans_shifted = trans + np.array([0.0, 0.0, z_shift_m])
@@ -1999,11 +2079,23 @@ model_drivers:
     #
     # print(f"Generated {len(X_goals)} pyramid goal positions")
 
-    # Visualize all goal positions
-    # brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
-    # for idx, X_goal in enumerate(X_goals):
-    #     meshcat.SetObject(f"debug/pyramid/goal_{idx}", brick_box, Rgba(0, 0, 1, 0.3))
-    #     meshcat.SetTransform(f"debug/pyramid/goal_{idx}", X_goal)
+    # ============ VISUALIZATION: Brick goal overlays (comment out to disable) ============
+    # Show transparent red/blue boxes at goal positions colored by which arm will place them
+    brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
+    left_base = np.array([0.65, 0.0])
+    right_base = np.array([-0.65, 0.0])
+
+    for idx, (X_source, X_goal) in enumerate(zip(poses[:len(X_goals)], X_goals)):
+        # Determine which arm will place this brick
+        p = X_source.translation()[:2]
+        use_left = np.linalg.norm(p - left_base) <= np.linalg.norm(p - right_base)
+
+        # Color code: red for left arm, blue for right arm
+        color = Rgba(1.0, 0.0, 0.0, 0.3) if use_left else Rgba(0.0, 0.0, 1.0, 0.3)
+
+        meshcat.SetObject(f"debug/goals/brick_{idx}", brick_box, color)
+        meshcat.SetTransform(f"debug/goals/brick_{idx}", X_goal)
+    # ============ END VISUALIZATION ============
 
     # Synchronous dual-arm pick and place
     if len(poses) >= len(X_goals):

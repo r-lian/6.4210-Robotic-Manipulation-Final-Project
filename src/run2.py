@@ -302,6 +302,7 @@ if __name__ == "__main__":
         plant = station.plant()
         plant_ctx = plant.GetMyContextFromRoot(ctx)
         iiwa_model = plant.GetModelInstanceByName(iiwa_name)
+        wsg_model = plant.GetModelInstanceByName(wsg_name)
         q_now = plant.GetPositions(plant_ctx, iiwa_model)
         t0 = ctx.get_time()
         tf = t0 + float(duration_s)
@@ -321,6 +322,38 @@ if __name__ == "__main__":
         # Set gripper position
         wsg_port = diagram.GetInputPort(f"{wsg_name}.position")
         wsg_port.FixValue(ctx, [opened])
+
+        # ============ VISUALIZATION: Joint trajectory triads ============
+        # Sample the trajectory and show gripper poses along the path
+        seg_id = int(time.time() * 1000)
+        G_body = plant.GetBodyByName("body", wsg_model)
+        num_samples = 8  # Show 8 triads along the path
+
+        # Save current state before modifying plant context
+        q_current_backup = plant.GetPositions(plant_ctx, iiwa_model)
+
+        for i in range(num_samples):
+            t_sample = t0 + i * (tf - t0) / (num_samples - 1)
+            q_sample = q_traj.value(t_sample).flatten()
+
+            # Set plant to sampled configuration to get gripper pose
+            plant.SetPositions(plant_ctx, iiwa_model, q_sample)
+            X_WG = plant.EvalBodyPoseInWorld(plant_ctx, G_body)
+
+            AddMeshcatTriad(
+                meshcat,
+                f"debug/joint_interp/{iiwa_name}/seg_{seg_id}_{i}",
+                X_PT=X_WG,
+                length=0.05,
+                radius=0.002,
+                opacity=0.5
+            )
+
+        # Restore plant state after visualization
+        plant.SetPositions(plant_ctx, iiwa_model, q_current_backup)
+
+        print(f"[{iiwa_name}] Drew {num_samples} triads for joint interpolation trajectory")
+        # ============ END VISUALIZATION ============
 
         # Step through with periodic publishing for speed
         num_steps = 10  # Fixed number of intermediate steps
@@ -360,7 +393,7 @@ if __name__ == "__main__":
         p_OG_o = np.zeros(3)
         # offset along -y_G (i.e., +z_O) to create a hover/clearance
         return RigidTransform(R_OG, p_OG_o) @ RigidTransform([0.0, -abs(finger_clearance_m), 0.0])
-    def place(X_WO: RigidTransform, X_WGoal: RigidTransform, sim_duration: float = 8.0):
+    def place(X_WO: RigidTransform, X_WGoal: RigidTransform, sim_duration: float = 8.0, brick_idx: int = 0):
         """
         Basic pick/place using a minimal DIK controller.
         - Chooses the nearer arm by XY distance to the brick.
@@ -385,8 +418,22 @@ if __name__ == "__main__":
         X_OG = compute_antipodal_grasp_box_O(brick_size)
         X_grasp = X_WO @ X_OG
         X_hover = RigidTransform(X_grasp.rotation(), X_grasp.translation() + np.array([0.0, 0.0, hover]))
-        X_WGgoal = X_WGoal @ X_OG 
+        X_WGgoal = X_WGoal @ X_OG
         X_WGgoal_hover = RigidTransform(X_WGgoal.rotation(), X_WGgoal.translation() + np.array([0.0, 0.0, hover]))
+
+        # ============ VISUALIZATION: Path triads ============
+        # Show coordinate frames for key waypoints
+        arm_color = "left" if use_left else "right"
+        AddMeshcatTriad(meshcat, f"debug/path/{arm_color}/brick{brick_idx}/prepick",
+                       X_PT=X_hover, length=0.08, radius=0.003, opacity=0.9)
+        AddMeshcatTriad(meshcat, f"debug/path/{arm_color}/brick{brick_idx}/grasp",
+                       X_PT=X_grasp, length=0.08, radius=0.003, opacity=0.9)
+        AddMeshcatTriad(meshcat, f"debug/path/{arm_color}/brick{brick_idx}/preplace",
+                       X_PT=X_WGgoal_hover, length=0.08, radius=0.003, opacity=0.9)
+        AddMeshcatTriad(meshcat, f"debug/path/{arm_color}/brick{brick_idx}/place",
+                       X_PT=X_WGgoal, length=0.08, radius=0.003, opacity=0.9)
+        print(f"[{arm_color}] Drew path triads for brick {brick_idx}")
+        # ============ END VISUALIZATION ============
 
         # Gripper (open/close) profile
         opened = 0.107
@@ -1225,25 +1272,31 @@ model_drivers:
 
     print(f"Generated {len(X_goals)} pyramid goal positions")
 
-    # Visualize all goal positions
-    # brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
-    # for idx, X_goal in enumerate(X_goals):
-    #     meshcat.SetObject(f"debug/pyramid/goal_{idx}", brick_box, Rgba(0, 0, 1, 0.3))
-    #     meshcat.SetTransform(f"debug/pyramid/goal_{idx}", X_goal)
+    # ============ VISUALIZATION: Goal positions ============
+    # Show transparent blue boxes at all goal positions
+    brick_box = Box(brick_size[0], brick_size[1], brick_size[2])
+    for idx, X_goal in enumerate(X_goals):
+        meshcat.SetObject(f"debug/pyramid/goal_{idx}", brick_box, Rgba(0, 0, 1, 0.3))
+        meshcat.SetTransform(f"debug/pyramid/goal_{idx}", X_goal)
+    # ============ END VISUALIZATION ============
 
     # Pick and place each brick from detected poses to pyramid positions
     if len(poses) >= len(X_goals):
         print(f"Placing {len(X_goals)} bricks into pyramid...")
         for idx, (X_source, X_goal) in enumerate(zip(poses[:len(X_goals)], X_goals)):
             print(f"\n=== Brick {idx + 1}/{len(X_goals)} ===")
-            # Visualize source and goal for this brick
-            # meshcat.SetObject(f"debug/brick_{idx}/source", brick_box, Rgba(1, 0, 0, 0.4))
-            # meshcat.SetTransform(f"debug/brick_{idx}/source", X_source)
-            # meshcat.SetObject(f"debug/brick_{idx}/goal", brick_box, Rgba(0, 1, 0, 0.4))
-            # meshcat.SetTransform(f"debug/brick_{idx}/goal", X_goal)
+
+            # ============ VISUALIZATION: Source and goal for this brick ============
+            # Show transparent red box at source (where brick is picked up)
+            # and transparent green box at goal (where brick will be placed)
+            meshcat.SetObject(f"debug/brick_{idx}/source", brick_box, Rgba(1, 0, 0, 0.4))
+            meshcat.SetTransform(f"debug/brick_{idx}/source", X_source)
+            meshcat.SetObject(f"debug/brick_{idx}/goal", brick_box, Rgba(0, 1, 0, 0.4))
+            meshcat.SetTransform(f"debug/brick_{idx}/goal", X_goal)
+            # ============ END VISUALIZATION ============
 
             # Execute pick and place
-            place(X_source, X_goal, sim_duration=12.0)
+            place(X_source, X_goal, sim_duration=12.0, brick_idx=idx)
             print(f"Brick {idx + 1} placed successfully")
     else:
         print(f"Error: Found {len(poses)} bricks but need {len(X_goals)} for pyramid")
